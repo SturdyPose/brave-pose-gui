@@ -19,6 +19,10 @@ jobs:
         enable-stack: True
         stack-setup-ghc: True
         stack-version: 'latest'
+    - name: "Install C dependencies"
+      run:
+        apt-get update 
+        apt-get install -y libgl1-mesa-glx libxi6 libxrandr2 libxxf86vm1 libxcursor1 libxinerama1
     - name: "Checkout code" 
       uses: actions/checkout@v4
     - name: "Run stack install"
