@@ -22,7 +22,7 @@ jobs:
     - name: "Update"
       run: sudo apt-get update 
     - name: "Install C dependencies"
-      run: sudo apt-get install -y libgl1-mesa-glx libxi6 libxrandr2 libxxf86vm1 libxcursor1 libxinerama1
+      run: sudo apt-get install -y freeglut3 freeglut3-dev libgl1-mesa-glx libxi-dev libxrandr-dev libxxf86vm-dev libxcursor-dev libxinerama-dev
     - name: "Checkout code" 
       uses: actions/checkout@v4
     - name: "Run stack install"
