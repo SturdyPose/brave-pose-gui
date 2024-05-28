@@ -4,6 +4,7 @@
 
 This project aims to be CSS based MVVM library using OpenGL as Haskell doesn't have any other GUI library. 
 
+![Test example](https://github.com/SturdyPose/brave-pose-gui/actions/workflows/haskell.yml/badge.svg?event=push)
 
 ## Why Haskell?
 
