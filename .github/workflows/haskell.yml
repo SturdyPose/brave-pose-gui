@@ -1,0 +1,22 @@
+name: Haskell Tests
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - name: "Setup haskell"
+      uses: haskell-actions/setup@v2.7.0
+      with:
+        enable-stack: True
+        stack-version: 'latest'
+    - name: "Run tests"
+      run: stack test
