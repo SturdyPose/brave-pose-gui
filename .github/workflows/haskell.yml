@@ -19,9 +19,8 @@ jobs:
         enable-stack: True
         stack-setup-ghc: True
         stack-version: 'latest'
-    - run: |
-        ls
-        pwd
+    - name: "Checkout code" 
+      uses: actions/checkout@v4
     - name: "Run stack install"
       run: stack install
     - name: "Run stack build"
