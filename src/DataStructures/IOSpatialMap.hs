@@ -61,10 +61,11 @@ insert cache@LinearCache{ _linearCacheData = dat, _linearCacheEmptyIndices = ref
 removeAt:: LinearCache a -> Int -> IO ()
 removeAt cache@LinearCache{ _linearCacheData = dat, _linearCacheEmptyIndices = indices, _linearCacheLength = length} i = do
   MV.write dat i Nothing
-  return cache {
-      _linearCacheEmptyIndices = i:indices
-    , _linearCacheLength = length - 1 
-  }
+  return ()
+  -- return cache {
+  --     _linearCacheEmptyIndices = i:indices
+  --   , _linearCacheLength = length - 1 
+  -- }
 
 -- remove:: LinearCache a -> SpatialData a -> IO ()
 -- remove cache@LinearCache{ _linearCacheData = dat, _linearCacheEmptyIndices = indices, _linearCacheLength = length} val = do

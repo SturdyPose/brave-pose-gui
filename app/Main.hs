@@ -258,7 +258,7 @@ processEvent ev =
             --     return (return ():: Demo ())) 
         -- traverse v
         -- sequence_ v
-        -- val <- lookupValueFromTree (floor x,screenHeight - floor y)
+        val <- lookupValueFromTree (floor x,screenHeight - floor y)
         -- liftIO $ print val
 
         return ()
