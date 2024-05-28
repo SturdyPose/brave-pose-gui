@@ -25,7 +25,7 @@ We haskellers love this language (even with some caveats) and this repo is a way
 - [X] Cross platform
 - [ ] Decent test coverage
 
-## Prerequisets: 
+## Prerequisites: 
 
 - GPU with latest OpenGL 4.6 support (this might be downgraded down the line if features like Tesselation shaders won't be needed)
 - Haskell stack
