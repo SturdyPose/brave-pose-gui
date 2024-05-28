@@ -20,8 +20,8 @@ jobs:
         stack-setup-ghc: True
         stack-version: 'latest'
     - run: |
+        ls
         pwd
-        ls -la
     - name: "Run stack install"
       run: stack install
     - name: "Run stack build"
