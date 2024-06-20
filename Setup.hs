@@ -1,2 +1,4 @@
 import Distribution.Simple
-main = defaultMain
+main = do 
+    print "Building..." 
+    defaultMain

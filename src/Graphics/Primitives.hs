@@ -9,7 +9,7 @@ import Control.Lens (makeLenses, (^.), (%~), (&))
 import Foreign (withArray, plusPtr, nullPtr, sizeOf, Bits (xor))
 import Foreign.Ptr (Ptr)
 import GHC.Float (int2Float)
-import Data.Foldable (foldrM)
+import Data.Foldable (foldrM, Foldable (toList))
 import qualified Graphics.GL as GLRaw
 import qualified Data.Vector as V
 import Control.Monad (forM_)
@@ -69,55 +69,55 @@ $(makeLenses ''Config)
 newtype Polygon = Polygon { _points:: V.Vector(Linear.V2 GL.GLfloat) }
   deriving Show
 
-data Pixel     = Pixel      { _pixelPosition:: Linear.V2 GL.GLfloat }
+data Pixel     = Pixel      { _pixelPosition:: !(Linear.V2 GL.GLfloat) }
   deriving Show
 
 $(makeLenses ''Pixel)
 
-data Line      = Line       { _linePosition:: Linear.V2 GL.GLfloat }
+data Line      = Line       { _linePosition:: !(Linear.V2 GL.GLfloat) }
   deriving Show
 
 $(makeLenses ''Line)
 
-data BezierLine= BezierLine { _bezierLinePosition:: Linear.V2 GL.GLfloat }
+data BezierLine= BezierLine { _bezierLinePosition:: !(Linear.V2 GL.GLfloat) }
   deriving Show
 
 $(makeLenses ''BezierLine)
 
-data Text      = Text       { _textPosition:: Linear.V2 GL.GLfloat }
+data Text      = Text       { _textPosition:: !(Linear.V2 GL.GLfloat) }
   deriving Show
 
 $(makeLenses ''Text)
 
-data Circle    = Circle     { _circlePosition:: Linear.V2 GL.GLfloat , _diameter:: GL.GLfloat }
+data Circle    = Circle     { _circlePosition:: !(Linear.V2 GL.GLfloat) , _diameter:: !GL.GLfloat }
   deriving Show
 
 $(makeLenses ''Circle)
 
-data Rectangle = Rectangle  { _rectanglePosition:: Linear.V2 GL.GLfloat , _width:: GL.GLfloat, _height:: GL.GLfloat}
+data Rectangle = Rectangle  { _rectanglePosition:: !(Linear.V2 GL.GLfloat) , _width:: !GL.GLfloat, _height:: !GL.GLfloat}
   deriving Show
 
 $(makeLenses ''Rectangle)
 
-data Ellipse   = Ellipse    { _ellipsePosition:: Linear.V2 GL.GLfloat }
+data Ellipse   = Ellipse    { _ellipsePosition:: !(Linear.V2 GL.GLfloat) }
   deriving Show
 
 $(makeLenses ''Ellipse)
 
-data Triangle  = Triangle   { _trianglePosition:: Linear.V2 GL.GLfloat }
+data Triangle  = Triangle   { _trianglePosition:: !(Linear.V2 GL.GLfloat) }
   deriving Show
 
 $(makeLenses ''Triangle)
 
 data Primitive =
-      PrimitivePixel       Pixel      
-    | PrimitiveLine        Line       
-    | PrimitiveBezierLine  BezierLine 
-    | PrimitiveText        Text       
-    | PrimitiveCircle      Circle     
-    | PrimitiveRectangle   Rectangle  
-    | PrimitiveEllipse     Ellipse    
-    | PrimitiveTriangle    Triangle   
+      PrimitivePixel       Pixel
+    | PrimitiveLine        Line
+    | PrimitiveBezierLine  BezierLine
+    | PrimitiveText        Text
+    | PrimitiveCircle      Circle
+    | PrimitiveRectangle   Rectangle
+    | PrimitiveEllipse     Ellipse
+    | PrimitiveTriangle    Triangle
     | PrimitivePoly        Polygon
     deriving Show
 
@@ -182,6 +182,7 @@ initPolygon    = Polygon   { _points = V.empty }
 
 
 numOfCirclePoints = 36
+numOfCirclePointsInGL = numOfCirclePoints + 4 
 
 genCirclePoints:: (Float, Float) -> Float -> V.Vector (Linear.V2 Float)
 genCirclePoints (x,y) diameter = segmentParts
@@ -197,10 +198,22 @@ genCirclePoints (x,y) diameter = segmentParts
                 Linear.V2 (cos (degreesToRad angle) * diameter/2 + x) (sin (degreesToRad angle) * diameter/2 + y)
             ) segmentList
 
+genCirclePointsForGL:: (Float, Float) -> Float -> V.Vector (Linear.V2 Float)
+genCirclePointsForGL (x,y) diameter = Linear.V2 0.0 0.0 `V.cons` segmentParts
+    where 
+      startAngle = 0
+      endAngle = 360
+      minAngle = min startAngle endAngle
+      maxAngle = max startAngle endAngle
+      stepLength = int2Float (maxAngle - minAngle) / (int2Float numOfCirclePoints)
+      segmentList = V.fromList [0..numOfCirclePoints + 1]
+      segmentParts = V.map (\segment ->
+              let angle = int2Float segment * stepLength in
+                Linear.V2 (cos (degreesToRad angle) * diameter/2 + x) (sin (degreesToRad angle) * diameter/2 + y)
+            ) segmentList
+
 pointWithinBoundary:: (Float, Float) -> Boundary -> Bool
 pointWithinBoundary (x,y) ((x1,y1), (x2,y2)) = x >= x1 && x <= x2 && y >= y1 && y <= y2
-
-
 
 
 data GLBuffers = GlBuffers {
@@ -215,14 +228,16 @@ data GLBuffers = GlBuffers {
 data RenderedObject = RenderedObject {
     _renderedObjectBuffers   :: !GLBuffers
   , _renderedObjectDrawCall  :: !(IO ())
+  , _renderedObjectProgram   :: !GL.Program
   , _renderedObjectCount     :: !Int
 }
 (makeLenses ''RenderedObject)
 
 data ObjectToRender = ObjectToRender {
-    _objectToRenderPrimitiveObject :: Primitive 
-  , _objectToRenderConfig :: Config
-  , _objectToRenderIndexWithinBuffer:: Int
+    _objectToRenderPrimitiveObject    :: !Primitive
+  , _objectToRenderConfig             :: !Config
+  , _objectToRenderIndexWithinBuffer  :: !Int
+  , _objectToRenderProgram            :: !GL.Program
 } deriving Show
 
 (makeLenses ''ObjectToRender)
@@ -232,11 +247,10 @@ instancedRenderingFromCache:: GL.Program -> RenderedObject -> IO RenderedObject
 instancedRenderingFromCache program obj@RenderedObject{} = do
   let vaoName = obj ^. renderedObjectBuffers ^. glBuffersObject
   GL.bindVertexArrayObject GL.$= Just vaoName
-  obj ^. renderedObjectDrawCall 
-        
-  GL.bindVertexArrayObject GL.$= Nothing
-  return obj 
+  obj ^. renderedObjectDrawCall
 
+  GL.bindVertexArrayObject GL.$= Nothing
+  return obj
 
 
 scaleMat :: Num a => a -> a -> a -> Linear.V4 (Linear.V4 a)
@@ -256,36 +270,35 @@ howToUpdate _ conf = do
 isPointInsidePolygon:: PolygonShape a => a -> (Float, Float) -> Bool
 isPointInsidePolygon a p@(x,y)
   | V.length points < 3 = error "Polygon must be made from at least 3 points"
-  | pointWithinBoundary p boundary = odd (if rayIntersects lastPoint firstPoint then numOfCrosses + 1 else numOfCrosses) 
-  | otherwise = False 
-  where 
+  | pointWithinBoundary p boundary = odd (if rayIntersects lastPoint firstPoint then numOfCrosses + 1 else numOfCrosses)
+  | otherwise = False
+  where
    Polygon points = toPolygon a
    boundary = toBoundary a
    (firstPoint, pointsWithoutFirstOne) = fromJust $ V.uncons points
    lastPoint = V.last points
-   (numOfCrosses , _ ) = V.foldr foldHelp (0, firstPoint) pointsWithoutFirstOne 
+   (numOfCrosses , _ ) = V.foldr foldHelp (0, firstPoint) pointsWithoutFirstOne
    rayIntersects (Linear.V2 xi yi) (Linear.V2 xj yj) = let x_intersection = (xj - xi) * (y - yi) / (yj - yi) + xi in ((yi > y) /= (yj > y)) && (x <= x_intersection )
-   foldHelp point (count, previousPoint) = 
+   foldHelp point (count, previousPoint) =
     if rayIntersects point previousPoint then (count+1, point) else (count, point)
 
-  
 class GLInstancedBindable a where
-  bindToGL:: [a] -> Config -> GL.Program -> IO RenderedObject
+  bindInstancedToGL:: [a] -> Config -> GL.Program -> IO RenderedObject
 
 instance GLInstancedBindable Circle where
-  bindToGL :: [Circle] -> Config -> GL.Program -> IO RenderedObject
-  bindToGL circles conf program = do
+  bindInstancedToGL :: [Circle] -> Config -> GL.Program -> IO RenderedObject
+  bindInstancedToGL circles conf program = do
     vaoName <- GL.genObjectName
     [vertexBuffer, transformBuffer, colorBuffer] <- GL.genObjectNames 3
     GL.bindVertexArrayObject GL.$= Just vaoName
     let stride = 2 * floatSize
-    let !numberOfElementsInBucket = length circles 
+    let !numberOfElementsInBucket = length circles
 
     let colors = map (\conf -> maybe (Linear.V4 0 0 0 0) colorTypeToRGBA (conf ^. m_backgroundColor)) $ replicate numberOfElementsInBucket conf
 
     GL.bindBuffer GL.ArrayBuffer GL.$= Just vertexBuffer
 
-    let segmentParts = V.toList $ genCirclePoints (0,0) 2
+    let segmentParts = [Linear.V2 0 0] ++ (V.toList $ genCirclePoints (0,0) 2)
 
     withArray segmentParts $ \ptr -> do
       let sizev = fromIntegral ((numOfCirclePoints*2 + 2) * sizeOf (0:: GL.GLfloat))
@@ -339,27 +352,27 @@ instance GLInstancedBindable Circle where
     GL.bindBuffer GL.ArrayBuffer GL.$= Nothing
     GL.bindVertexArrayObject GL.$= Nothing
     let drawCall = GL.drawArraysInstanced GL.TriangleFan 0 (toEnum numOfCirclePoints) (toEnum numberOfElementsInBucket)
-      
 
     let buffers = GlBuffers {
         _glBuffersObject           = vaoName
-      , _glBuffersVertexBuffer     = vertexBuffer 
-      , _glBuffersColorBuffer      = colorBuffer 
-      , _glBuffersTransformBuffer  = transformBuffer 
+      , _glBuffersVertexBuffer     = vertexBuffer
+      , _glBuffersColorBuffer      = colorBuffer
+      , _glBuffersTransformBuffer  = transformBuffer
       , _glProgram                 = program
     }
 
     let renderedObject = RenderedObject {
-        _renderedObjectBuffers = buffers
+        _renderedObjectBuffers  = buffers
+      , _renderedObjectCount    = toEnum numberOfElementsInBucket
       , _renderedObjectDrawCall = drawCall
-      , _renderedObjectCount = 0
+      , _renderedObjectProgram  = program
     }
 
-    return renderedObject 
+    return renderedObject
 
 instance GLInstancedBindable Rectangle where
-  bindToGL :: [Rectangle] -> Config -> GL.Program -> IO RenderedObject
-  bindToGL recs conf program = do 
+  bindInstancedToGL :: [Rectangle] -> Config -> GL.Program -> IO RenderedObject
+  bindInstancedToGL recs conf program = do
     vaoName <- GL.genObjectName
     [vertexBuffer, transformBuffer, colorBuffer] <- GL.genObjectNames 3
     GL.bindVertexArrayObject GL.$= Just vaoName
@@ -369,11 +382,9 @@ instance GLInstancedBindable Rectangle where
     let colors = map (\conf -> maybe (Linear.V4 0 0 0 0) colorTypeToRGBA (conf ^. m_backgroundColor)) $ replicate numberOfElementsInBucket conf
 
     GL.bindBuffer GL.ArrayBuffer GL.$= Just vertexBuffer
-
-    GL.bindBuffer GL.ArrayBuffer GL.$= Just vertexBuffer
     let segmentParts = [0,0, 0,1, 1,0,
                         0,1, 1,0, 1,1] :: [GL.GLfloat]
-    
+
     withArray segmentParts $ \ptr -> do
       let sizev = fromIntegral (12 * sizeOf (0:: GL.GLfloat))
       GL.bufferData GL.ArrayBuffer GL.$= (sizev, ptr, GL.StaticDraw)
@@ -395,7 +406,7 @@ instance GLInstancedBindable Rectangle where
 
     GLRaw.glVertexAttribDivisor 1 1
 
-    let !transformMat = fmap (primitiveTransformMat . PrimitiveRectangle) recs 
+    let !transformMat = fmap (primitiveTransformMat . PrimitiveRectangle) recs
     let !lengthOfTransformMat = length transformMat
 
     GL.bindBuffer GL.ArrayBuffer GL.$= Just transformBuffer
@@ -428,16 +439,70 @@ instance GLInstancedBindable Rectangle where
     GL.bindVertexArrayObject GL.$= Nothing
     let buffers = GlBuffers {
         _glBuffersObject           = vaoName
-      , _glBuffersVertexBuffer     = vertexBuffer 
-      , _glBuffersColorBuffer      = colorBuffer 
-      , _glBuffersTransformBuffer  = transformBuffer 
+      , _glBuffersVertexBuffer     = vertexBuffer
+      , _glBuffersColorBuffer      = colorBuffer
+      , _glBuffersTransformBuffer  = transformBuffer
       , _glProgram                 = program
     }
 
     let renderedObject = RenderedObject {
-        _renderedObjectBuffers = buffers
+        _renderedObjectBuffers  = buffers
+      , _renderedObjectCount    = toEnum numberOfElementsInBucket
       , _renderedObjectDrawCall = GL.drawArraysInstanced GL.Triangles 0 (toEnum 6) (toEnum numberOfElementsInBucket)
-      , _renderedObjectCount = 0
+      , _renderedObjectProgram  = program
+    }
+
+    return renderedObject
+
+
+class GLBindable a where
+  bindToGL:: a -> Config -> GL.Program -> IO RenderedObject
+
+instance GLBindable Circle where
+  bindToGL circ conf program = do 
+    vaoName <- GL.genObjectName
+    [vertexBuffer, transformBuffer, colorBuffer] <- GL.genObjectNames 3
+    GL.bindVertexArrayObject GL.$= Just vaoName
+    let stride = 2 * floatSize
+
+    let colors = maybe (Linear.V4 0 0 0 0) colorTypeToRGBA (conf ^. m_backgroundColor)
+
+    GL.bindBuffer GL.ArrayBuffer GL.$= Just vertexBuffer
+    let segmentParts = V.toList $ genCirclePointsForGL (0,0) 2
+
+    withArray segmentParts $ \ptr -> do
+      let sizev = fromIntegral ((numOfCirclePointsInGL * 2) * sizeOf (0:: GL.GLfloat))
+      GL.bufferData GL.ArrayBuffer GL.$= (sizev, ptr, GL.StaticDraw)
+
+    let vPosition  = GL.AttribLocation 0
+    GL.vertexAttribPointer vPosition GL.$=
+        (GL.ToFloat, GL.VertexArrayDescriptor 2 GL.Float stride (bufferOffset (0:: GL.GLsizei)))
+    GL.vertexAttribArray vPosition GL.$= GL.Enabled
+
+    GL.bindBuffer GL.ArrayBuffer GL.$= Nothing
+    GL.bindVertexArrayObject GL.$= Nothing
+    let buffers = GlBuffers {
+        _glBuffersObject           = vaoName
+      , _glBuffersVertexBuffer     = vertexBuffer
+      , _glBuffersColorBuffer      = colorBuffer
+      , _glBuffersTransformBuffer  = transformBuffer
+      , _glProgram                 = program
+    }
+
+    let renderedObject = RenderedObject {
+        _renderedObjectBuffers  = buffers
+      , _renderedObjectCount    = 1
+      , _renderedObjectDrawCall = do 
+        vcolorLoc <- GL.get (GL.uniformLocation program "vcolor")
+        GL.uniform vcolorLoc GL.$= let Linear.V4 r g b a = colors in GL.Vector4 r g b a 
+
+        let !transformMat = (primitiveTransformMat . PrimitiveCircle) circ
+        matTrans <- GL.newMatrix GL.RowMajor $ concatMap toList transformMat:: IO (GL.GLmatrix GL.GLfloat)
+        transformLoc <- GL.get (GL.uniformLocation program "transform")
+        GL.uniform transformLoc  GL.$= matTrans
+
+        GL.drawArrays GL.TriangleFan 0 $ toEnum numOfCirclePointsInGL
+      , _renderedObjectProgram  = program
     }
 
     return renderedObject
