@@ -15,8 +15,8 @@ spatialMapTests = do
 
     _ <- SM.appendGridRange floored1 floored2 r spatialMap
 
-    SM.rangeToGridCoords floored1 floored2 spatialMap >>= print
-    SM.lookupCoords (15, 15) spatialMap >>= print
+    _ <- SM.rangeToGridCoords floored1 floored2 spatialMap 
+    _ <- SM.lookupCoords (15, 15) spatialMap 
     
     
     return ()

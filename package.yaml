@@ -35,6 +35,8 @@ dependencies:
 - unordered-containers
 - HUnit
 - directory
+- time
+- uuid
 
 ghc-options:
 - -Wall

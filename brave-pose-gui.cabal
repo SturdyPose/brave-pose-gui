@@ -49,8 +49,10 @@ library
     , linear
     , mtl
     , stm
+    , time
     , transformers
     , unordered-containers
+    , uuid
     , vector
   default-language: Haskell2010
 
@@ -77,8 +79,10 @@ executable brave-pose-gui-exe
     , linear
     , mtl
     , stm
+    , time
     , transformers
     , unordered-containers
+    , uuid
     , vector
   default-language: Haskell2010
 
@@ -106,7 +110,9 @@ test-suite brave-pose-gui-test
     , linear
     , mtl
     , stm
+    , time
     , transformers
     , unordered-containers
+    , uuid
     , vector
   default-language: Haskell2010

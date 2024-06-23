@@ -1,11 +1,17 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE InstanceSigs #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE ExplicitNamespaces #-}
+{-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE DefaultSignatures #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE DeriveGeneric #-}
 module Graphics.Primitives where
 
 import qualified Graphics.Rendering.OpenGL as GL
 import qualified Linear
-import Control.Lens (makeLenses, (^.), (%~), (&))
+import Control.Lens (makeLenses, (^.), (%~), (&), (.~))
 import Foreign (withArray, plusPtr, nullPtr, sizeOf, Bits (xor))
 import Foreign.Ptr (Ptr)
 import GHC.Float (int2Float)
@@ -18,11 +24,19 @@ import Foreign.Marshal (with)
 import GHC.Real (infinity)
 import qualified Data.Vector.Storable as VS
 import Foreign.Storable (peek)
+import Data.IORef (newIORef, writeIORef, modifyIORef)
+import GHC.IORef (readIORef)
+import GHC.Generics (U1 (..), type (:*:) (..), K1 (..), M1 (..), Generic (..))
+import Control.Applicative (Alternative ((<|>)))
+import Data.UUID
 
 floatSize64  = (fromIntegral $ sizeOf (0.0::GL.GLfloat)) :: GL.GLsizeiptr
 floatSize  = (fromIntegral $ sizeOf (0.0::GL.GLfloat)) :: GL.GLsizei
 v2Size = 2 * floatSize
 v4Size = 2 * v2Size
+
+whenJust :: Applicative m => Maybe a -> (a -> m ()) -> m ()
+whenJust mg f = maybe (pure ()) f mg
 
 bufferOffset :: Integral a => a -> Ptr b
 bufferOffset = plusPtr nullPtr . fromIntegral
@@ -50,11 +64,12 @@ data Events = MouseHoverIn | MouseHoverOut
 
 
 data Config = Config {
-      _m_backgroundColor::Maybe ColorType
-    , _m_color:: Maybe ColorType
-    , _m_dimensions:: Maybe (Linear.V4 Float)
-    , _m_scale:: Maybe Float
-} deriving (Show, Eq, Ord)
+      _m_backgroundColor :: Maybe ColorType
+    , _m_color           :: Maybe ColorType
+    , _m_dimensions      :: Maybe (Linear.V4 Float)
+    , _m_scale           :: Maybe (Linear.V3 Float)
+    , _m_translate       :: Maybe (Linear.V3 Float)
+} deriving (Show, Eq, Ord, Generic)
 
 emptyConfig:: Config
 emptyConfig = Config {
@@ -62,7 +77,30 @@ emptyConfig = Config {
   , _m_color           = Nothing
   , _m_dimensions      = Nothing
   , _m_scale           = Nothing
+  , _m_translate       = Nothing
 }
+
+class GCombine f where
+  gCombine :: f p -> f p -> f p
+
+instance GCombine U1 where
+  gCombine U1 U1 = U1
+
+instance (GCombine a, GCombine b) => GCombine (a :*: b) where
+  gCombine (a1 :*: b1) (a2 :*: b2) = gCombine a1 a2 :*: gCombine b1 b2
+
+instance (Alternative f) => GCombine (K1 i (f a)) where
+  gCombine (K1 a) (K1 b) = K1 (a <|> b)
+
+instance (GCombine a) => GCombine (M1 i c a) where
+  gCombine (M1 a) (M1 b) = M1 (gCombine a b)
+
+class Combine a where
+  combine :: a -> a -> a
+  default combine :: (Generic a, GCombine (Rep a)) => a -> a -> a
+  combine x y = to $ gCombine (from x) (from y)
+
+instance Combine Config
 
 $(makeLenses ''Config)
 
@@ -131,6 +169,7 @@ class PrimitiveShape a where
 class PolygonShape a where 
   toPolygon:: a -> Polygon 
   toBoundary:: a -> Boundary
+  applyConfig:: a -> Config -> a
 
 instance PolygonShape Primitive where
   toPolygon (PrimitiveCircle      x) = toPolygon x
@@ -153,6 +192,16 @@ instance PolygonShape Primitive where
   toBoundary (PrimitiveTriangle    x) = error "Not implemented"
   toBoundary (PrimitivePoly        x) = toBoundary x
 
+  applyConfig (PrimitiveCircle      x) conf = PrimitiveCircle $ applyConfig x conf
+  applyConfig (PrimitiveRectangle   x) conf = PrimitiveRectangle $ applyConfig x conf 
+  applyConfig (PrimitivePixel       x) conf = error "Not implemented"
+  applyConfig (PrimitiveLine        x) conf = error "Not implemented"
+  applyConfig (PrimitiveBezierLine  x) conf = error "Not implemented"
+  applyConfig (PrimitiveText        x) conf = error "Not implemented"
+  applyConfig (PrimitiveEllipse     x) conf = error "Not implemented"
+  applyConfig (PrimitiveTriangle    x) conf = error "Not implemented"
+  applyConfig (PrimitivePoly        x) conf = error "Not implemented"
+
 instance PolygonShape Polygon where
   -- CCW polygons, always check if polygons are ccw
   toPolygon x = x
@@ -162,10 +211,25 @@ instance PolygonShape Circle where
   toPolygon (Circle {_circlePosition = Linear.V2 x y, _diameter = d}) = Polygon { _points = genCirclePoints (x,y) d }
   toBoundary Circle{_circlePosition = (Linear.V2 x y), _diameter = d} = ((x - d/2, y - d/2), (x + d/2, y + d/2))
 
+  applyConfig circ@Circle{_circlePosition = pos, _diameter = d} conf = 
+    case conf of 
+      Config { _m_translate = Just trans, _m_scale = Just v } -> Circle {_circlePosition = trans ^. Linear._xy, _diameter = v  ^. Linear._x }
+      Config { _m_scale = Just v } -> circ{_diameter = v  ^. Linear._x }
+      Config { _m_translate = Just trans } -> circ{_circlePosition = trans ^. Linear._xy}
+      c -> circ
+
+
 instance PolygonShape Rectangle where
   toPolygon (Rectangle  {_rectanglePosition = Linear.V2 x y, _width = w, _height = h }) = Polygon 
     { _points= V.fromList [Linear.V2 x y, Linear.V2 (x + w) y, Linear.V2 (x + w) (y + h), Linear.V2 x (y + h) ]}
   toBoundary Rectangle{_rectanglePosition = (Linear.V2 x y), _width = w, _height = h} = ((x, y), (x + w, y + h))
+
+  applyConfig rect conf = rect
+    -- case conf of 
+    --   Config { _m_translate = Just trans, _m_scale = Just v } -> Circle {_circlePosition = trans ^. Linear._xy, _diameter = v  ^. Linear._x }
+    --   Config { _m_scale = Just v } -> circ{_diameter = v  ^. Linear._x }
+    --   Config { _m_translate = Just trans } -> circ{_circlePosition = trans ^. Linear._xy}
+    --   c -> circ
 
   -- toPolygon _             = error "Not implemented"
 
@@ -192,14 +256,14 @@ genCirclePoints (x,y) diameter = segmentParts
       minAngle = min startAngle endAngle
       maxAngle = max startAngle endAngle
       stepLength = int2Float (maxAngle - minAngle) / (int2Float numOfCirclePoints)
-      segmentList = V.fromList [0..numOfCirclePoints]
+      segmentList = V.fromList [0..numOfCirclePoints + 1]
       segmentParts = V.map (\segment ->
               let angle = int2Float segment * stepLength in
                 Linear.V2 (cos (degreesToRad angle) * diameter/2 + x) (sin (degreesToRad angle) * diameter/2 + y)
             ) segmentList
 
-genCirclePointsForGL:: (Float, Float) -> Float -> V.Vector (Linear.V2 Float)
-genCirclePointsForGL (x,y) diameter = Linear.V2 0.0 0.0 `V.cons` segmentParts
+genCirclePointsForGL:: (Float, Float) -> V.Vector (Linear.V2 Float)
+genCirclePointsForGL (x,y) = Linear.V2 0.0 0.0 `V.cons` segmentParts
     where 
       startAngle = 0
       endAngle = 360
@@ -209,7 +273,7 @@ genCirclePointsForGL (x,y) diameter = Linear.V2 0.0 0.0 `V.cons` segmentParts
       segmentList = V.fromList [0..numOfCirclePoints + 1]
       segmentParts = V.map (\segment ->
               let angle = int2Float segment * stepLength in
-                Linear.V2 (cos (degreesToRad angle) * diameter/2 + x) (sin (degreesToRad angle) * diameter/2 + y)
+                Linear.V2 (cos (degreesToRad angle) + x) (sin (degreesToRad angle) + y)
             ) segmentList
 
 pointWithinBoundary:: (Float, Float) -> Boundary -> Bool
@@ -226,10 +290,11 @@ data GLBuffers = GlBuffers {
 (makeLenses ''GLBuffers)
 
 data RenderedObject = RenderedObject {
-    _renderedObjectBuffers   :: !GLBuffers
-  , _renderedObjectDrawCall  :: !(IO ())
-  , _renderedObjectProgram   :: !GL.Program
-  , _renderedObjectCount     :: !Int
+    _renderedObjectBuffers     :: !GLBuffers
+  , _renderedObjectDrawCall    :: !(IO ())
+  , _renderedObjectProgram     :: !GL.Program
+  , _renderedObjectCount       :: !Int
+  , _renderedObjectBindConfig  :: !(Int -> Config -> IO())
 }
 (makeLenses ''RenderedObject)
 
@@ -237,6 +302,7 @@ data ObjectToRender = ObjectToRender {
     _objectToRenderPrimitiveObject    :: !Primitive
   , _objectToRenderConfig             :: !Config
   , _objectToRenderIndexWithinBuffer  :: !Int
+  , _objectToRenderUUID               :: !UUID
   , _objectToRenderProgram            :: !GL.Program
 } deriving Show
 
@@ -366,6 +432,7 @@ instance GLInstancedBindable Circle where
       , _renderedObjectCount    = toEnum numberOfElementsInBucket
       , _renderedObjectDrawCall = drawCall
       , _renderedObjectProgram  = program
+      , _renderedObjectBindConfig = \_ _ -> return ()
     }
 
     return renderedObject
@@ -450,6 +517,20 @@ instance GLInstancedBindable Rectangle where
       , _renderedObjectCount    = toEnum numberOfElementsInBucket
       , _renderedObjectDrawCall = GL.drawArraysInstanced GL.Triangles 0 (toEnum 6) (toEnum numberOfElementsInBucket)
       , _renderedObjectProgram  = program
+      , _renderedObjectBindConfig = \i newConf -> do 
+        whenJust (_m_backgroundColor newConf) $ \col -> do
+
+          GL.bindBuffer GL.ArrayBuffer GL.$= Just colorBuffer
+          let Linear.V4 r g b a = colorTypeToRGBA col
+
+          withArray [r,g,b,a] $ \pColor -> do
+            let sizeOfV4 = 4 * (toEnum $ sizeOf r)
+            GL.bufferSubData GL.ArrayBuffer GL.WriteToBuffer (toEnum i * sizeOfV4) (sizeOfV4) pColor
+            return ()
+
+          GL.bindBuffer GL.ArrayBuffer GL.$= Nothing
+        
+        return ()
     }
 
     return renderedObject
@@ -460,15 +541,14 @@ class GLBindable a where
 
 instance GLBindable Circle where
   bindToGL circ conf program = do 
+    ioRefConfig <- newIORef conf
     vaoName <- GL.genObjectName
     [vertexBuffer, transformBuffer, colorBuffer] <- GL.genObjectNames 3
     GL.bindVertexArrayObject GL.$= Just vaoName
     let stride = 2 * floatSize
 
-    let colors = maybe (Linear.V4 0 0 0 0) colorTypeToRGBA (conf ^. m_backgroundColor)
-
     GL.bindBuffer GL.ArrayBuffer GL.$= Just vertexBuffer
-    let segmentParts = V.toList $ genCirclePointsForGL (0,0) 2
+    let segmentParts = V.toList $ genCirclePointsForGL (0,0)
 
     withArray segmentParts $ \ptr -> do
       let sizev = fromIntegral ((numOfCirclePointsInGL * 2) * sizeOf (0:: GL.GLfloat))
@@ -493,20 +573,29 @@ instance GLBindable Circle where
         _renderedObjectBuffers  = buffers
       , _renderedObjectCount    = 1
       , _renderedObjectDrawCall = do 
+
+        config <- readIORef ioRefConfig
+        let colors = maybe (Linear.V4 0 0 0 0) colorTypeToRGBA (config ^. m_backgroundColor)
+
         vcolorLoc <- GL.get (GL.uniformLocation program "vcolor")
         GL.uniform vcolorLoc GL.$= let Linear.V4 r g b a = colors in GL.Vector4 r g b a 
 
         let !transformMat = (primitiveTransformMat . PrimitiveCircle) circ
-        matTrans <- GL.newMatrix GL.RowMajor $ concatMap toList transformMat:: IO (GL.GLmatrix GL.GLfloat)
+
+        let newTransform = maybe transformMat (\vec -> transformMat & Linear.translation .~ vec ) (config ^. m_translate) 
+
+        matTrans <- GL.newMatrix GL.RowMajor $ concatMap toList newTransform:: IO (GL.GLmatrix GL.GLfloat)
         transformLoc <- GL.get (GL.uniformLocation program "transform")
         GL.uniform transformLoc  GL.$= matTrans
 
         GL.drawArrays GL.TriangleFan 0 $ toEnum numOfCirclePointsInGL
       , _renderedObjectProgram  = program
+      , _renderedObjectBindConfig = \_ config -> do
+          modifyIORef ioRefConfig $ \oldConf -> combine config oldConf
+          return ()
     }
 
     return renderedObject
-
 
 instance PrimitiveShape Circle where
   toPrimitive = PrimitiveCircle
