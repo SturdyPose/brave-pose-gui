@@ -19,7 +19,7 @@ import Data.Foldable (foldrM, Foldable (toList))
 import qualified Graphics.GL as GLRaw
 import qualified Data.Vector as V
 import Control.Monad (forM_)
-import Data.Maybe (listToMaybe, isJust, fromMaybe, fromJust)
+import Data.Maybe (listToMaybe, isJust, fromMaybe, fromJust, isNothing)
 import Foreign.Marshal (with)
 import GHC.Real (infinity)
 import qualified Data.Vector.Storable as VS
@@ -166,8 +166,8 @@ type Boundary = ((Float,Float), (Float,Float))
 class PrimitiveShape a where
   toPrimitive:: a -> Primitive
 
-class PolygonShape a where 
-  toPolygon:: a -> Polygon 
+class Show a => PolygonShape a where
+  toPolygon:: a -> Polygon
   toBoundary:: a -> Boundary
   applyConfig:: a -> Config -> a
 
@@ -193,7 +193,7 @@ instance PolygonShape Primitive where
   toBoundary (PrimitivePoly        x) = toBoundary x
 
   applyConfig (PrimitiveCircle      x) conf = PrimitiveCircle $ applyConfig x conf
-  applyConfig (PrimitiveRectangle   x) conf = PrimitiveRectangle $ applyConfig x conf 
+  applyConfig (PrimitiveRectangle   x) conf = PrimitiveRectangle $ applyConfig x conf
   applyConfig (PrimitivePixel       x) conf = error "Not implemented"
   applyConfig (PrimitiveLine        x) conf = error "Not implemented"
   applyConfig (PrimitiveBezierLine  x) conf = error "Not implemented"
@@ -211,8 +211,8 @@ instance PolygonShape Circle where
   toPolygon (Circle {_circlePosition = Linear.V2 x y, _diameter = d}) = Polygon { _points = genCirclePoints (x,y) d }
   toBoundary Circle{_circlePosition = (Linear.V2 x y), _diameter = d} = ((x - d/2, y - d/2), (x + d/2, y + d/2))
 
-  applyConfig circ@Circle{_circlePosition = pos, _diameter = d} conf = 
-    case conf of 
+  applyConfig circ@Circle{_circlePosition = pos, _diameter = d} conf =
+    case conf of
       Config { _m_translate = Just trans, _m_scale = Just v } -> Circle {_circlePosition = trans ^. Linear._xy, _diameter = v  ^. Linear._x }
       Config { _m_scale = Just v } -> circ{_diameter = v  ^. Linear._x }
       Config { _m_translate = Just trans } -> circ{_circlePosition = trans ^. Linear._xy}
@@ -220,7 +220,7 @@ instance PolygonShape Circle where
 
 
 instance PolygonShape Rectangle where
-  toPolygon (Rectangle  {_rectanglePosition = Linear.V2 x y, _width = w, _height = h }) = Polygon 
+  toPolygon (Rectangle  {_rectanglePosition = Linear.V2 x y, _width = w, _height = h }) = Polygon
     { _points= V.fromList [Linear.V2 x y, Linear.V2 (x + w) y, Linear.V2 (x + w) (y + h), Linear.V2 x (y + h) ]}
   toBoundary Rectangle{_rectanglePosition = (Linear.V2 x y), _width = w, _height = h} = ((x, y), (x + w, y + h))
 
@@ -246,11 +246,11 @@ initPolygon    = Polygon   { _points = V.empty }
 
 
 numOfCirclePoints = 36
-numOfCirclePointsInGL = numOfCirclePoints + 4 
+numOfCirclePointsInGL = numOfCirclePoints + 4
 
 genCirclePoints:: (Float, Float) -> Float -> V.Vector (Linear.V2 Float)
 genCirclePoints (x,y) diameter = segmentParts
-    where 
+    where
       startAngle = 0
       endAngle = 360
       minAngle = min startAngle endAngle
@@ -264,7 +264,7 @@ genCirclePoints (x,y) diameter = segmentParts
 
 genCirclePointsForGL:: (Float, Float) -> V.Vector (Linear.V2 Float)
 genCirclePointsForGL (x,y) = Linear.V2 0.0 0.0 `V.cons` segmentParts
-    where 
+    where
       startAngle = 0
       endAngle = 360
       minAngle = min startAngle endAngle
@@ -281,7 +281,7 @@ pointWithinBoundary (x,y) ((x1,y1), (x2,y2)) = x >= x1 && x <= x2 && y >= y1 && 
 
 
 data GLBuffers = GlBuffers {
-    _glBuffersObject          :: !GL.VertexArrayObject 
+    _glBuffersObject          :: !GL.VertexArrayObject
   , _glBuffersVertexBuffer    :: !GL.BufferObject
   , _glBuffersColorBuffer     :: !GL.BufferObject
   , _glBuffersTransformBuffer :: !GL.BufferObject
@@ -289,12 +289,14 @@ data GLBuffers = GlBuffers {
 } deriving Show
 (makeLenses ''GLBuffers)
 
+
+  
 data RenderedObject = RenderedObject {
     _renderedObjectBuffers     :: !GLBuffers
   , _renderedObjectDrawCall    :: !(IO ())
   , _renderedObjectProgram     :: !GL.Program
   , _renderedObjectCount       :: !Int
-  , _renderedObjectBindConfig  :: !(Int -> Config -> IO())
+  , _renderedObjectRebind      :: !(Primitive -> Int -> Config -> IO())
 }
 (makeLenses ''RenderedObject)
 
@@ -302,9 +304,18 @@ data ObjectToRender = ObjectToRender {
     _objectToRenderPrimitiveObject    :: !Primitive
   , _objectToRenderConfig             :: !Config
   , _objectToRenderIndexWithinBuffer  :: !Int
-  , _objectToRenderUUID               :: !UUID
+  , _objectToRenderID                 :: !String
   , _objectToRenderProgram            :: !GL.Program
 } deriving Show
+
+instance PolygonShape ObjectToRender where
+  toPolygon ObjectToRender{_objectToRenderPrimitiveObject=p } = toPolygon p
+  toBoundary ObjectToRender{_objectToRenderPrimitiveObject=p } = toBoundary p
+  applyConfig o@ObjectToRender{_objectToRenderPrimitiveObject=p } c = 
+    o{ 
+        _objectToRenderPrimitiveObject = applyConfig p c
+      , _objectToRenderConfig          = c
+     }
 
 (makeLenses ''ObjectToRender)
 
@@ -347,6 +358,24 @@ isPointInsidePolygon a p@(x,y)
    rayIntersects (Linear.V2 xi yi) (Linear.V2 xj yj) = let x_intersection = (xj - xi) * (y - yi) / (yj - yi) + xi in ((yi > y) /= (yj > y)) && (x <= x_intersection )
    foldHelp point (count, previousPoint) =
     if rayIntersects point previousPoint then (count+1, point) else (count, point)
+
+rayIntersectsPolygon:: PolygonShape a => a -> Linear.V2 Float -> Linear.V2 Float -> Bool
+rayIntersectsPolygon p (Linear.V2 x0 y0) (Linear.V2 x1 y1)
+  | numOfPolyPoints < 3 = error "Polygon must be made from at least 3 points"
+  | isJust checkEachEdge = True 
+  | otherwise = False
+  where
+    Polygon points = toPolygon p
+    numOfPolyPoints = V.length points
+    edgeIntersection (Linear.V2 x2 y2) (Linear.V2 x3 y3)
+      | denominator == 0 = Nothing
+      | t >= 0 && t <= 1 && u >= 0 && u <= 1 = Just t
+      | otherwise = Nothing
+      where
+          denominator = (x0 - x1) * (y2 - y3) - (y0 - y1) * (x2 - x3)
+          t = ((x0 - x2)*(y2 - y3) - (y0 - y2)*(x2 - x3))/ denominator
+          u = -(((x0 - x1)*(y0 - y2) - (y0 - y1)*(x0 - x2)) / denominator)
+    checkEachEdge = foldr (\i m_t -> if isNothing m_t then let firstPoint = points V.! i in let nextPoint = points V.! ((i + 1) `mod` numOfPolyPoints) in edgeIntersection firstPoint nextPoint else m_t) Nothing [0..numOfPolyPoints-1]
 
 class GLInstancedBindable a where
   bindInstancedToGL:: [a] -> Config -> GL.Program -> IO RenderedObject
@@ -432,7 +461,7 @@ instance GLInstancedBindable Circle where
       , _renderedObjectCount    = toEnum numberOfElementsInBucket
       , _renderedObjectDrawCall = drawCall
       , _renderedObjectProgram  = program
-      , _renderedObjectBindConfig = \_ _ -> return ()
+      , _renderedObjectRebind = \_ _ _ -> return ()
     }
 
     return renderedObject
@@ -517,7 +546,7 @@ instance GLInstancedBindable Rectangle where
       , _renderedObjectCount    = toEnum numberOfElementsInBucket
       , _renderedObjectDrawCall = GL.drawArraysInstanced GL.Triangles 0 (toEnum 6) (toEnum numberOfElementsInBucket)
       , _renderedObjectProgram  = program
-      , _renderedObjectBindConfig = \i newConf -> do 
+      , _renderedObjectRebind = \obj i newConf -> do
         whenJust (_m_backgroundColor newConf) $ \col -> do
 
           GL.bindBuffer GL.ArrayBuffer GL.$= Just colorBuffer
@@ -529,7 +558,7 @@ instance GLInstancedBindable Rectangle where
             return ()
 
           GL.bindBuffer GL.ArrayBuffer GL.$= Nothing
-        
+
         return ()
     }
 
@@ -540,8 +569,9 @@ class GLBindable a where
   bindToGL:: a -> Config -> GL.Program -> IO RenderedObject
 
 instance GLBindable Circle where
-  bindToGL circ conf program = do 
+  bindToGL circ conf program = do
     ioRefConfig <- newIORef conf
+    ioRefCirc <- newIORef circ
     vaoName <- GL.genObjectName
     [vertexBuffer, transformBuffer, colorBuffer] <- GL.genObjectNames 3
     GL.bindVertexArrayObject GL.$= Just vaoName
@@ -572,17 +602,18 @@ instance GLBindable Circle where
     let renderedObject = RenderedObject {
         _renderedObjectBuffers  = buffers
       , _renderedObjectCount    = 1
-      , _renderedObjectDrawCall = do 
+      , _renderedObjectDrawCall = do
 
         config <- readIORef ioRefConfig
+        circle <- readIORef ioRefCirc 
         let colors = maybe (Linear.V4 0 0 0 0) colorTypeToRGBA (config ^. m_backgroundColor)
 
         vcolorLoc <- GL.get (GL.uniformLocation program "vcolor")
-        GL.uniform vcolorLoc GL.$= let Linear.V4 r g b a = colors in GL.Vector4 r g b a 
+        GL.uniform vcolorLoc GL.$= let Linear.V4 r g b a = colors in GL.Vector4 r g b a
 
-        let !transformMat = (primitiveTransformMat . PrimitiveCircle) circ
+        let !transformMat = (primitiveTransformMat . PrimitiveCircle) circle
 
-        let newTransform = maybe transformMat (\vec -> transformMat & Linear.translation .~ vec ) (config ^. m_translate) 
+        let newTransform = maybe transformMat (\vec -> transformMat & Linear.translation .~ vec ) (config ^. m_translate)
 
         matTrans <- GL.newMatrix GL.RowMajor $ concatMap toList newTransform:: IO (GL.GLmatrix GL.GLfloat)
         transformLoc <- GL.get (GL.uniformLocation program "transform")
@@ -590,8 +621,9 @@ instance GLBindable Circle where
 
         GL.drawArrays GL.TriangleFan 0 $ toEnum numOfCirclePointsInGL
       , _renderedObjectProgram  = program
-      , _renderedObjectBindConfig = \_ config -> do
+      , _renderedObjectRebind = \(PrimitiveCircle cir) _ config -> do
           modifyIORef ioRefConfig $ \oldConf -> combine config oldConf
+          writeIORef ioRefCirc cir
           return ()
     }
 
@@ -602,3 +634,15 @@ instance PrimitiveShape Circle where
 
 instance PrimitiveShape Rectangle where
   toPrimitive = PrimitiveRectangle
+
+
+coords:: Primitive -> Linear.V2 Float
+coords (PrimitiveCircle      x) = _circlePosition x
+coords (PrimitiveRectangle   x) = _rectanglePosition x
+coords (PrimitivePixel       x) = error "Not implemented"
+coords (PrimitiveLine        x) = error "Not implemented"
+coords (PrimitiveBezierLine  x) = error "Not implemented"
+coords (PrimitiveText        x) = error "Not implemented"
+coords (PrimitiveEllipse     x) = error "Not implemented"
+coords (PrimitiveTriangle    x) = error "Not implemented"
+coords (PrimitivePoly        x) = error "Not implemented"

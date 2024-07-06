@@ -8,13 +8,14 @@ module Main (main) where
 
 import Control.Concurrent.STM    (TQueue, atomically, newTQueueIO, tryReadTQueue, writeTQueue)
 import Control.Monad             (unless, when, void, forM)
-import Control.Monad.RWS.Strict  (RWST, asks, evalRWST, get, liftIO, modify)
+import Control.Monad.RWS.Strict  (RWST, asks, evalRWST, runRWST, get, liftIO, modify)
 
 import qualified Graphics.Rendering.OpenGL as GL
 import qualified Graphics.UI.GLFW          as GLFW
 import qualified Data.Map.Strict as M
 import qualified Data.HashMap.Strict as HM
 import qualified Data.ByteString as B
+import qualified Interpolation.Interpolator as Interp
 import Graphics.Primitives
 import Graphics.ShaderLoader
 import qualified Linear
@@ -30,6 +31,10 @@ import Data.UUID.V4
 import Data.Maybe (fromMaybe)
 import Data.IORef (newIORef, readIORef)
 import GHC.IORef (writeIORef)
+import Control.Applicative ((<|>))
+import Control.Monad.State.Strict (StateT(runStateT), execStateT)
+import qualified Inputs.MouseHandling as MouseHandling
+import Control.Monad (forM_)
 
 --------------------------------------------------------------------------------
 
@@ -53,91 +58,77 @@ data Event =
 --------------------------------------------------------------------------------
 
 data Env = Env
-    { envEventsChan    :: TQueue Event
-    , envWindow        :: !GLFW.Window
-    , _envStateShaders:: !(M.Map B.ByteString GL.Program)
+    { _envEventsChan   :: TQueue Event
+    , _envWindow       :: !GLFW.Window
+    , _envStateShaders :: !(M.Map B.ByteString GL.Program)
+    , _envTimeStart    :: !SystemTime
     }
 
-data RawAndRenderedObjectPair = RawAndRenderedObjectPair {
-      _rawFromPair      :: ObjectToRender
-    , _renderedFromPair :: RenderedObject
+data CpuGpuRepPair = CpuGpuRepPair {
+      _cpuRep :: ObjectToRender
+    , _gpuRep :: RenderedObject
 }
 
-instance Show RawAndRenderedObjectPair where
-    show RawAndRenderedObjectPair{_rawFromPair = a} = show a
+instance Show CpuGpuRepPair where
+    show CpuGpuRepPair{_cpuRep = a} = show a
 
-$(makeLenses ''RawAndRenderedObjectPair)
+instance PolygonShape CpuGpuRepPair where
+  toPolygon o@CpuGpuRepPair{_cpuRep = a} = toPolygon a
+  toBoundary o@CpuGpuRepPair{_cpuRep = a} = toBoundary a
+  applyConfig o@CpuGpuRepPair{_cpuRep = a} conf = o{_cpuRep = applyConfig a conf}
 
+$(makeLenses ''CpuGpuRepPair)
+
+type Demo = RWST Env () State IO
 
 data State = State
     { _stateWindowWidth           :: !Int
     , _stateWindowHeight          :: !Int
-    , _stateElementsOnScreen      :: !(SM.IOSpatialMap RawAndRenderedObjectPair)
+    , _stateElementsOnScreen      :: !(SM.IOSpatialMap CpuGpuRepPair)
     , _stateRenderedCache         :: !(V.Vector RenderedObject)
-    , _stateInteractable          :: !(HM.HashMap UUID RawAndRenderedObjectPair)
-    , _stateMousePos              :: !(Double, Double)
-    , _stateMouseButtonState      :: !MouseButtonState
+    , _stateInteractable          :: !(M.Map String (MouseHandlingType, MouseHandling.MouseHandlingEvents Demo MouseHandlingType))
+    , _stateMousePos              :: !(Int, Int)
+    , _stateMousePosPreviousFrame :: !(Int, Int)
+    , _stateMouseButtonState      :: !MouseHandling.MouseButtonState
     , _stateFrameCounter          :: !Double
     , _stateCurrentSysTime        :: !SystemTime
                                     -- Time, function taking time difference, 
-    , _stateInterpolators         :: ![Interpolator]
-    , _stateMouseEvents           :: !MouseEvents
+    , _statePlugins               :: !Plugins
     }
 
-type Demo = RWST Env () State IO
-
-
-data Interpolator = Interpolator
+data Plugins = Plugins
     {
-      _interpolatorStartTime :: !SystemTime
-    , _interpolatorDuration  :: !Float
-    , _interpolatorCallback  :: !(Linear.V2 Float -> Demo ())
-    , _interpolatorFunction  :: !(Float -> Linear.V2 Float)
+          _pluginsInterpolation:: !(Interp.InterpolationEnv, Interp.InterpolationState Demo)
+        , _pluginsMouseHandling:: !(MouseHandling.MouseHandlingEnv Demo MouseHandlingType, MouseHandling.MouseHandlingState MouseHandlingType)
     }
 
-data MouseButtonState = PressDown | Pressed | Released | None
-    deriving (Show, Eq)
+type MouseHandlingType = CpuGpuRepPair
 
-data MouseEvents = MouseEvents
-    {
-      _onMiceClicks   :: [Double -> Double -> Demo ()]
-    , _onMicePressed  :: [Double -> Double -> Demo ()]
-    , _onMiceReleased :: [Double -> Double -> Demo ()]
-    }
-
-$(makeLenses ''MouseEvents)
 $(makeLenses ''State)
+$(makeLenses ''Plugins)
+$(makeLenses ''Interp.InterpolationEnv)
+$(makeLenses ''Interp.InterpolationState)
+$(makeLenses ''MouseHandling.MouseHandlingEnv)
+$(makeLenses ''MouseHandling.MouseHandlingState)
+$(makeLenses ''MouseHandling.MouseHandlingEvents)
+$(makeLenses ''MouseHandling.ModifierKeys)
+
 
 --------------------------------------------------------------------------------
 
-getFromHashMap:: UUID -> Demo (Maybe RawAndRenderedObjectPair)
-getFromHashMap uuid = do
-    interactable <- _stateInteractable <$> get
+-- getFromHashMap:: UUID -> Demo (Maybe CpuGpuRepPair)
+-- getFromHashMap uuid = do
+--     interactable <- _stateInteractable <$> get
 
-    return $ HM.lookup uuid interactable
+--     return $ M.lookup uuid interactable
 
-insertToHashMap:: RawAndRenderedObjectPair -> Demo ()
-insertToHashMap obj = do
-    interactable <- _stateInteractable <$> get
-    let uuid = obj ^. (rawFromPair . objectToRenderUUID)
+insertToHashMap:: (MouseHandling.Interactable MouseHandlingType, MouseHandling.MouseHandlingEvents Demo MouseHandlingType) -> Demo ()
+insertToHashMap pair@(i, events) = do
+    let handlingLens = pluginsMouseHandling . _1 . mouseHandlingEnvInteractables
+    modify $ \s -> s & (statePlugins . handlingLens) %~ \m -> M.insert (MouseHandling.interactableId i) pair m
 
-    modify $ \s -> s & stateInteractable .~ HM.alter (\_ -> Just obj) uuid interactable
     return()
 
-
-proccessMouseEvents:: Demo ()
-proccessMouseEvents = do
-    miceEvents <- _stateMouseEvents <$> get
-    mouseState <- _stateMouseButtonState <$> get
-    (x,y) <- _stateMousePos <$> get
-
-    case mouseState of
-        PressDown -> mapM_ (\f -> f x y) $ miceEvents ^. onMiceClicks
-        Pressed -> mapM_ (\f -> f x y) $ miceEvents ^. onMicePressed
-        Released -> mapM_ (\f -> f x y) $ miceEvents ^. onMiceReleased
-        _ -> return ()
-
-    return ()
 
 createState:: Int -> Int -> IO State
 createState width height = do
@@ -145,25 +136,78 @@ createState width height = do
     spatialMap <- liftIO $ SM.createIOSpatialMap (20, 20) (width, height)
     sysTime <- getSystemTime
 
-    let mouseEvents = MouseEvents {
-          _onMiceClicks   = []
-        , _onMicePressed  = []
-        , _onMiceReleased = []
-    }
+    plugins <- createPlugins
 
     return State
         { _stateWindowWidth           = width
         , _stateWindowHeight          = height
         , _stateElementsOnScreen      = spatialMap
         , _stateRenderedCache         = V.empty
-        , _stateInteractable          = HM.empty
+        , _stateInteractable          = M.empty
         , _stateMousePos              = (0,0)
-        , _stateMouseButtonState      = None
+        , _stateMousePosPreviousFrame = (0,0)
+        , _stateMouseButtonState      = MouseHandling.None
         , _stateFrameCounter          = 0
         , _stateCurrentSysTime        = sysTime
-        , _stateInterpolators         = []
-        , _stateMouseEvents           = mouseEvents
+        , _statePlugins               = plugins
         }
+
+createPlugins:: IO Plugins
+createPlugins = do
+    sysTime <- getSystemTime
+
+    let interpEnv = Interp.InterpolationEnv {
+            Interp._interpolationEnvTime = sysTime
+        }
+
+    let interpState = Interp.InterpolationState { 
+            Interp._interpolationStateInterpolators = []
+        }
+
+    let mouseEnv = MouseHandling.MouseHandlingEnv {
+          MouseHandling._mouseHandlingEnvMouseCoordinates              = (0,0) 
+        , MouseHandling._mouseHandlingEnvMouseCoordinatesPreviousFrame = (0,0)
+        , MouseHandling._mouseHandlingEnvInteractables                 = M.empty
+        , MouseHandling._mouseHandlingModifierKeys                     = MouseHandling.ModifierKeys False False False False 
+        , MouseHandling._mouseHandlingMouseButtonState                 = MouseHandling.None
+    }
+
+    let mouseState = MouseHandling.MouseHandlingState {
+          MouseHandling._mouseHandlingStateActiveInteractables = M.empty
+        , MouseHandling._mouseHandlingPreviousMouseState       = MouseHandling.None
+    }
+    
+    return Plugins {
+          _pluginsInterpolation = (interpEnv, interpState)
+        , _pluginsMouseHandling = (mouseEnv, mouseState)
+    }
+
+
+updatePluginInputs:: Demo ()
+updatePluginInputs = do
+    -- Interpolation plugin
+    sysTime <- liftIO getSystemTime
+
+    modify $ \s -> s & (statePlugins . pluginsInterpolation . _1 . interpolationEnvTime) .~ sysTime
+
+    -- Mouse plugin
+    s <- get
+
+    -- This should may be differently handled
+    -- mouseHandlingEvents <- MouseHandling.emptyEvent
+    -- let ints = map 
+    --         (\(id, interactable) -> (MouseHandling.Interactable (interactable ^. cpuRep) (show id), mouseHandlingEvents)) $ M.toList (s ^. stateInteractable)
+    
+    let previousMouseEnv = s ^. (statePlugins . pluginsMouseHandling . _1)
+    let mouseEnv = previousMouseEnv {
+          MouseHandling._mouseHandlingEnvMouseCoordinates              = s ^. stateMousePos
+        , MouseHandling._mouseHandlingEnvMouseCoordinatesPreviousFrame = s ^. stateMousePosPreviousFrame
+    }
+
+    modify $ \s -> s & (statePlugins . pluginsMouseHandling . _1 ) .~ mouseEnv 
+
+    return ()
+
 
 main :: IO ()
 main = do
@@ -195,10 +239,12 @@ main = do
         (fbWidth, fbHeight) <- GLFW.getFramebufferSize win
         shaders <- compileShaders
         st <- createState fbWidth fbHeight
+        sysTime <- getSystemTime
         let env = Env
-              { envEventsChan    = eventsChan
-              , envWindow        = win
+              { _envEventsChan    = eventsChan
+              , _envWindow        = win
               , _envStateShaders = shaders
+              , _envTimeStart    = sysTime
               }
         runDemo env st
 
@@ -206,84 +252,24 @@ main = do
 
 --------------------------------------------------------------------------------
 
-runInterpolatorHasElapsed:: Interpolator -> SystemTime -> Demo Bool
-runInterpolatorHasElapsed i currentTime = do
-    let Interpolator {
-          _interpolatorCallback  = cb
-        , _interpolatorDuration  = durationTime
-        , _interpolatorStartTime = startTime
-        , _interpolatorFunction  = f
-    } = i
-
-    let MkSystemTime {
-          systemSeconds = curSecs
-        , systemNanoseconds = curNanos
-    } = currentTime
-
-    let MkSystemTime {
-          systemSeconds = startSecs
-        , systemNanoseconds = startNanos
-    } = startTime
-
-    let startTimeInSecs = ((fromIntegral startSecs) + (fromIntegral startNanos) * 1E-9) :: Double
-    let currentTimeInSecs = ((fromIntegral curSecs) + (fromIntegral curNanos) * 1E-9) :: Double
-
-    let elapsedMs = (currentTimeInSecs - startTimeInSecs) * 1000
-
-    -- let elapsedMs = (elapsedSecs * 1000) + (fromIntegral elapsedNanos `div` 1000000)
-    -- let durationTime = MkSystemTime {
-    --       systemSeconds = floor $ dur / 1000
-    --     , systemNanoseconds = (castFloatToWord32 dur `mod` 1000) * 10E9
-    -- }
-
-    let t = min 1 (double2Float elapsedMs / durationTime)
-
-    let currentValue = f t
-    cb currentValue
-
-    return $ t == 1
+processInnerStateMonad:: Interp.InterpolationPlugin Demo a -> Demo a
+processInnerStateMonad plugin = do 
+    (env, previousState) <- ( _pluginsInterpolation . _statePlugins ) <$> get 
+    (a, r, _) <- runRWST plugin env previousState 
+    -- Monad within clicking can change environment variable
+    (envNew, _) <- ( _pluginsInterpolation . _statePlugins ) <$> get 
+    modify $ \s -> s & (statePlugins . pluginsInterpolation) .~ (envNew, r)
+    return a
 
 
-interpolate:: Float -> Linear.V2 Float -> Linear.V2 Float -> (Linear.V2 Float -> Demo ()) -> (Float -> Linear.V2 Float) -> Demo ()
-interpolate timeLength a b lerpCallback diffFunction = do
-    startTime <- _stateCurrentSysTime <$> get
-    let i = Interpolator {
-              _interpolatorCallback  = lerpCallback
-            , _interpolatorDuration  = timeLength
-            , _interpolatorStartTime = startTime
-            , _interpolatorFunction  = diffFunction
-        }
-
-    modify $ \s -> s & stateInterpolators %~ (:) i
-
--- in miliseconds
-lerp2, qerp2:: Float -> Linear.V2 Float -> Linear.V2 Float -> (Linear.V2 Float -> Demo ()) -> Demo ()
-lerp2 timeLength a b lerpCallback = do
-    let lerpInterpolator timeDifference = a + timeDifference Linear.*^ (b-a)
-    interpolate timeLength a b lerpCallback lerpInterpolator
-
-qerp2 timeLength a b lerpCallback = error "Qerp not implemented"
-
-
--- lerp2:: Float -> Linear.V2 Float -> Linear.V2 Float -> (Float -> Demo ()) -> Demo ()
--- lerp2 timeLength a b lerpCallback = do
-
-processInterpolations:: Demo ()
-processInterpolations = do
-    interps <- _stateInterpolators <$> get
-
-    currentTime <- _stateCurrentSysTime <$> get
-
-    newInterps <- foldrM (\interp interpAcc-> do
-        hasElapsed <- runInterpolatorHasElapsed interp currentTime
-        return $ if hasElapsed
-            then []
-            else interp:interpAcc
-        ) [] interps
-
-    modify $ \s -> s & stateInterpolators .~ newInterps
-
-    return ()
+processInnerStateMonadMouse:: MouseHandling.MouseHandlingPlugin Demo MouseHandlingType b -> Demo b
+processInnerStateMonadMouse plugin = do 
+    (env, previousState) <- ( _pluginsMouseHandling . _statePlugins ) <$> get 
+    (a, r, _) <- runRWST plugin env previousState 
+    -- Monad within clicking can change environment variable
+    (envNew, _) <- ( _pluginsMouseHandling . _statePlugins ) <$> get 
+    modify $ \s -> s & (statePlugins . pluginsMouseHandling) .~ (envNew, r)
+    return a
 
 startup:: Demo ()
 startup = do
@@ -299,13 +285,12 @@ startup = do
 
     cache <- liftIO $ bindToGL thing conf program
 
-    uuid1 <- liftIO nextRandom
     let objectToRender = ObjectToRender {
             _objectToRenderPrimitiveObject = toPrimitive thing
         ,   _objectToRenderConfig = conf
         ,   _objectToRenderIndexWithinBuffer = 1
         ,   _objectToRenderProgram = program
-        ,   _objectToRenderUUID = uuid1
+        ,   _objectToRenderID = "1"
     }
 
     let conf2 = emptyConfig {_m_backgroundColor = Just $ RGBA (Linear.V4 0 1 1 1)}
@@ -313,17 +298,16 @@ startup = do
 
     cache2 <- liftIO $ bindToGL thing2 conf2 program
 
-    uuid2 <- liftIO nextRandom
     let objectToRender2 = ObjectToRender {
             _objectToRenderPrimitiveObject = toPrimitive thing2
         ,   _objectToRenderConfig = conf2
         ,   _objectToRenderIndexWithinBuffer = 1
         ,   _objectToRenderProgram = program
-        ,   _objectToRenderUUID = uuid2
+        ,   _objectToRenderID = "2"
     }
 
-    let pair = RawAndRenderedObjectPair objectToRender cache
-    let pair2 = RawAndRenderedObjectPair objectToRender2 cache2
+    let pair = CpuGpuRepPair objectToRender cache
+    let pair2 = CpuGpuRepPair objectToRender2 cache2
 
 
     let recs = map (\(x, y) -> Rectangle (Linear.V2 x y) 10 10) [(x,y)| y <- [10,30..120],  x <- [10,30..120]]
@@ -334,61 +318,136 @@ startup = do
 
     pair3 <- imapM (\i rect -> do 
         uuid3 <- liftIO nextRandom
-        return $ RawAndRenderedObjectPair ObjectToRender {
+        return $ CpuGpuRepPair ObjectToRender {
             _objectToRenderPrimitiveObject = toPrimitive rect
         ,   _objectToRenderConfig = conf2
         ,   _objectToRenderIndexWithinBuffer = i
-        ,   _objectToRenderUUID = uuid3
+        ,   _objectToRenderID = "a" ++ show i 
         ,   _objectToRenderProgram = programInstanced
     } cache3) recs
 
-    isCancelledRef <- liftIO $ newIORef False
-    let someOnRelease x y = do
-            m_val <- getFromHashMap uuid2
-            let m_obj = (_objectToRenderPrimitiveObject . _rawFromPair) <$> m_val 
-            let defaultOrAlreadyExisting = fromMaybe (toPrimitive thing2) m_obj
-            let floatX = double2Float x 
-            let floatY = double2Float y
+    -- isCancelledRef <- liftIO $ newIORef False
+    -- let someOnRelease x y = do
+    --         m_val <- getFromHashMap uuid2
+    --         let m_obj = (_objectToRenderPrimitiveObject . _cpuRep) <$> m_val 
+    --         let defaultOrAlreadyExisting = fromMaybe (toPrimitive thing2) m_obj
+    --         let floatX = double2Float x 
+    --         let floatY = double2Float y
 
-            when (isPointInsidePolygon (defaultOrAlreadyExisting) (floatX, floatY)) $ do
-                liftIO $ writeIORef isCancelledRef False
-                lerp2 1000 (Linear.V2 floatX floatY) (Linear.V2 (floatX) (floatY + 100)) $ \(Linear.V2 a b) -> do
-                    isCancelled <- liftIO $ readIORef isCancelledRef
-                    unless isCancelled $ do 
-                        let conf = emptyConfig { _m_translate = Just $ (Linear.V3 a b 0)}
-                        let v = pair2 & (rawFromPair . objectToRenderPrimitiveObject) .~ applyConfig (toPrimitive thing2) conf
-                        insertToHashMap v 
-                        -- let iWithinBuffer = obj ^. objectToRenderIndexWithinBuffer
-                        liftIO $ (cache2 ^. renderedObjectBindConfig) 1 conf
-                        return ()
-            return ()
+    --         when (isPointInsidePolygon (defaultOrAlreadyExisting) (floatX, floatY)) $ do
+    --             liftIO $ writeIORef isCancelledRef False
+    --             processInnerStateMonad $ Interp.lerp2 1000 (Linear.V2 floatX floatY) (Linear.V2 floatX 0) $ \(Linear.V2 a b) -> do
+    --                 isCancelled <- liftIO $ readIORef isCancelledRef
+    --                 unless isCancelled $ do 
+    --                     let newConf = (emptyConfig { _m_translate = Just $ (Linear.V3 a b 0)}) `combine` conf
+    --                     let v = pair2 & (cpuRep . objectToRenderPrimitiveObject) .~ applyConfig (toPrimitive thing2) newConf
+    --                     -- insertToHashMap v 
+    --                     -- let iWithinBuffer = obj ^. objectToRenderIndexWithinBuffer
+    --                     liftIO $ (cache2 ^. renderedObjectBindConfig) 1 newConf 
+    --                     return ()
+    --         return ()
 
-    let someOnPress x y = do
-            m_val <- getFromHashMap uuid2
-            let m_obj = (_objectToRenderPrimitiveObject . _rawFromPair) <$> m_val 
-            let defaultOrAlreadyExisting = fromMaybe (toPrimitive thing2) m_obj
+    -- let someOnPress x y = do
+    --         m_val <- getFromHashMap uuid2
+    --         let m_obj = (_objectToRenderPrimitiveObject . _cpuRep) <$> m_val 
+    --         let defaultOrAlreadyExisting = fromMaybe (toPrimitive thing2) m_obj
 
-            when (isPointInsidePolygon (defaultOrAlreadyExisting) (double2Float x, double2Float y)) $ do
-                liftIO $ writeIORef isCancelledRef True
-                let conf = emptyConfig { _m_translate = Just $ Linear.V3 (double2Float x) (double2Float y) 0 }
-                let v = pair2 & (rawFromPair . objectToRenderPrimitiveObject) .~ applyConfig (toPrimitive thing2) conf
-                insertToHashMap v 
+    --         when (isPointInsidePolygon (defaultOrAlreadyExisting) (double2Float x, double2Float y)) $ do
+    --             liftIO $ writeIORef isCancelledRef True
+    --             let conf = emptyConfig { _m_translate = Just $ Linear.V3 (double2Float x) (double2Float y) 0, _m_backgroundColor = Just $ RGBA $ Linear.V4 1 0 0 0}
+    --             let v = pair2 & (cpuRep . objectToRenderPrimitiveObject) .~ applyConfig (toPrimitive thing2) conf
+    --             -- insertToHashMap v 
+    --             -- let iWithinBuffer = obj ^. objectToRenderIndexWithinBuffer
+    --             liftIO $ (cache2 ^. renderedObjectBindConfig) 1 conf
+    --             return ()
+
+    mouseHandlingEvents <- MouseHandling.emptyEvent
+
+    let someOnClick (x,y) modifierKeys (element, elementEvents) id = do
+            -- m_val <- getFromHashMap uuid1
+            -- m_valToFollow <- getFromHashMap uuid2
+            -- let m_obj = (_objectToRenderPrimitiveObject . _cpuRep) <$> m_val 
+            -- let m_objToFollow = (_objectToRenderPrimitiveObject . _cpuRep) <$> m_valToFollow
+            -- let defaultOrAlreadyExisting = fromMaybe (toPrimitive thing) m_obj
+            -- let defaultOrAlreadyExistingFollow = fromMaybe (toPrimitive thing2) m_objToFollow
+            let floatX = int2Float x 
+            let floatY = int2Float y
+
+            -- let coordinatesToFollow = coords defaultOrAlreadyExistingFollow
+            -- let startCoords = coords defaultOrAlreadyExisting
+            processInnerStateMonad $ Interp.lerp2 1200 (Linear.V2 floatX floatY) (Linear.V2 (floatX + 100) (floatY + 100)) $ \vec -> do
+                -- let conf = emptyConfig { _m_translate = Just $ (Linear.V3 a b 0)}
+                let newV = case element ^. (cpuRep . objectToRenderPrimitiveObject) of
+                        (PrimitiveCircle (Circle t d)) -> PrimitiveCircle $ Circle vec d 
+                        _ -> newV
+                let v = element & (cpuRep . objectToRenderPrimitiveObject) .~ newV 
+                -- insertToHashMap $ (applyConfig element conf, mouseHandlingEvents & onMiceClicks .~ someOnClick)
                 -- let iWithinBuffer = obj ^. objectToRenderIndexWithinBuffer
-                liftIO $ (cache2 ^. renderedObjectBindConfig) 1 conf
+                -- insertToHashMap (MouseHandling.Interactable pair2 "2", mouseHandlingEvents & onMiceClicks .~ someOnClick)
+                insertToHashMap (MouseHandling.Interactable v id, elementEvents)
+                liftIO $ (v ^. (gpuRep . renderedObjectRebind)) (v ^. (cpuRep . objectToRenderPrimitiveObject)) 1 conf
                 return ()
             return ()
 
                     --  & stateInteractable .~ M.fromList [pair, pair2] ++ pair3
     modify $ \s -> s & stateRenderedCache .~ V.fromList [cache, cache2, cache3]
-                     & (stateMouseEvents . onMicePressed) %~ (:) someOnPress
-                     & (stateMouseEvents . onMiceReleased) %~ (:) someOnRelease
 
-    insertToHashMap pair
-    insertToHashMap pair2
-    mapM_ insertToHashMap pair3
+    insertToHashMap 
+        (
+            MouseHandling.Interactable pair2 "2", 
+            mouseHandlingEvents & onMiceClicks .~ someOnClick
+                                & onMiceMove .~ onMouseMove
+                                & onMiceEnter .~ onHover
+                                & onMiceLeave .~ onHoverOut
+        )
+    -- insertToHashMap pair2
+    -- mapM_ insertToHashMap pair3
 
     return ()
 
+
+onHover :: (a, b) -> p -> (CpuGpuRepPair, MouseHandling.MouseHandlingEvents Demo MouseHandlingType) -> String -> Demo ()
+onHover (x,y) modKeys (element, elementEvents) id = do
+    let conf = emptyConfig { 
+        _m_backgroundColor = Just $ RGBA (Linear.V4 1 0 0 1)}
+
+    let newV = case element ^. (cpuRep . objectToRenderPrimitiveObject) of
+            (PrimitiveCircle (Circle t d)) -> PrimitiveCircle $ Circle t (200)
+            _ -> newV
+
+    let v = element & (cpuRep . objectToRenderPrimitiveObject) .~ newV
+                    & (cpuRep . objectToRenderConfig) .~ conf
+    insertToHashMap (MouseHandling.Interactable v id, elementEvents)
+    liftIO $ (v ^. (gpuRep . renderedObjectRebind)) (v ^. (cpuRep . objectToRenderPrimitiveObject)) 1 conf
+    return ()
+
+onHoverOut :: (a, b) -> p -> (CpuGpuRepPair, MouseHandling.MouseHandlingEvents Demo MouseHandlingType) -> String -> Demo ()
+onHoverOut (x,y) modKeys (element, elementEvents) id = do
+    let conf = emptyConfig { 
+            _m_backgroundColor = Just $ RGBA (Linear.V4 0 1 0 1)}
+
+    let newV = case element ^. (cpuRep . objectToRenderPrimitiveObject) of
+            (PrimitiveCircle (Circle t d)) -> PrimitiveCircle $ Circle t (50)
+            _ -> newV
+
+    let v = element & (cpuRep . objectToRenderPrimitiveObject) .~ newV
+                    & (cpuRep . objectToRenderConfig) .~ conf
+    insertToHashMap (MouseHandling.Interactable v id, elementEvents)
+    liftIO $ (v ^. (gpuRep . renderedObjectRebind)) (v ^. (cpuRep . objectToRenderPrimitiveObject)) 1 conf
+    return ()
+
+onMouseMove :: (Int, Int) -> MouseHandling.ModifierKeys -> (CpuGpuRepPair, MouseHandling.MouseHandlingEvents Demo MouseHandlingType) -> String -> Demo ()
+onMouseMove (x,y) modKeys (element, elementEvents) id = do
+    when (MouseHandling._mouseHandlingCtrlPressed modKeys) $ do
+        let newV = case element ^. (cpuRep . objectToRenderPrimitiveObject) of
+                (PrimitiveCircle (Circle t d)) -> PrimitiveCircle $ Circle (Linear.V2 (int2Float x) (int2Float y)) (d)
+                _ -> newV
+
+        let v = element & (cpuRep . objectToRenderPrimitiveObject) .~ newV
+                        -- & (cpuRep . objectToRenderConfig) .~ conf
+        insertToHashMap (MouseHandling.Interactable v id, elementEvents)
+        liftIO $ (v ^. (gpuRep . renderedObjectRebind)) (v ^. (cpuRep . objectToRenderPrimitiveObject)) 1 (v ^. (cpuRep . objectToRenderConfig))
+    return ()
 
 -- GLFW-b is made to be very close to the C API, so creating a window is pretty
 -- clunky by Haskell standards. A higher-level API would have some function
@@ -468,7 +527,7 @@ run = do
     modify $ \s -> s & stateFrameCounter %~ (+) 1
                      & stateCurrentSysTime .~ sysTime
 
-    win <- asks envWindow
+    win <- asks _envWindow
 
     cache <- _stateRenderedCache <$> get
 
@@ -484,16 +543,19 @@ run = do
         GL.flush  -- not necessary, but someone recommended it
         GLFW.pollEvents
     processEvents
-    processInterpolations
 
-    proccessMouseEvents
-    handleMouseButton
+    processInnerStateMonad Interp.processInterpolations
+    processInnerStateMonadMouse MouseHandling.processMouseEvents
+    updatePluginInputs
+
+    modify $ \s -> s & stateMousePosPreviousFrame .~ (s ^. stateMousePos)
+
     q <- liftIO $ GLFW.windowShouldClose win
     unless q run
 
 processEvents :: Demo ()
 processEvents = do
-    tc <- asks envEventsChan
+    tc <- asks _envEventsChan
     me <- liftIO $ atomically $ tryReadTQueue tc
     case me of
       Just e -> do
@@ -505,7 +567,7 @@ printEvent :: String -> [String] -> Demo ()
 printEvent cbname fields =
     liftIO $ putStrLn $ cbname ++ ": " ++ unwords fields
 
-setMousePos:: Double -> Double -> Demo ()
+setMousePos:: Int -> Int -> Demo ()
 setMousePos x y = do
     modify $ \s -> s & stateMousePos .~ (x,y)
 
@@ -514,7 +576,7 @@ handleMouseEvent = do
     (x,y) <- _stateMousePos <$> get
     interactable <- _stateInteractable <$> get
     -- newInteractable <- forM interactable $ \raw -> do
-    --     let obj = raw ^. rawFromPair
+    --     let obj = raw ^. cpuRep
     --     let d = obj ^. objectToRenderPrimitiveObject
 
     --     let conf = emptyConfig {
@@ -523,9 +585,9 @@ handleMouseEvent = do
     --         _m_translate = Just $ Linear.V3 (double2Float x) (double2Float y) 0 }
     --     if (isPointInsidePolygon (d) (double2Float x, double2Float y)) then do
     --     -- liftIO $ print x
-    --         let v = raw & (rawFromPair . objectToRenderPrimitiveObject) .~ applyConfig d conf
+    --         let v = raw & (cpuRep . objectToRenderPrimitiveObject) .~ applyConfig d conf
     --         let iWithinBuffer = obj ^. objectToRenderIndexWithinBuffer
-    --         liftIO $ (raw ^. renderedFromPair ^. renderedObjectBindConfig) iWithinBuffer conf
+    --         liftIO $ (raw ^. gpuRep ^. renderedObjectBindConfig) iWithinBuffer conf
     --         return v
     --     else 
     --         return raw 
@@ -534,20 +596,12 @@ handleMouseEvent = do
 
     return ()
 
-handleMouseButton:: Demo()
-handleMouseButton = do
-    mouseState <- _stateMouseButtonState <$> get
-    case mouseState of
-        Released -> modify $ \s -> s & stateMouseButtonState .~ None
-        PressDown -> modify $ \s -> s & stateMouseButtonState .~ Pressed
-        _ -> return ()
-
 processEvent :: Event -> Demo ()
 processEvent ev =
     case ev of
       (EventError e s) -> do
           printEvent "error" [show e, show s]
-          win <- asks envWindow
+          win <- asks _envWindow
           liftIO $ GLFW.setWindowShouldClose win True
 
       (EventWindowSize _ width height) ->
@@ -571,22 +625,38 @@ processEvent ev =
         -- screenHeight <- _stateWindowHeight <$> get
         -- grid <- _stateElementsOnScreen <$> get
 
-        setMousePos x y
+        setMousePos (fromEnum x) (fromEnum y)
         -- val <- lookupValueFromTree (floor x,screenHeight - floor y)
 
         return ()
 
       (EventKey win k scancode ks mk) -> do
+          let mouseButtonLens = statePlugins . pluginsMouseHandling . _1 . mouseHandlingModifierKeys
+
+          unless (ks == GLFW.KeyState'Repeating) $ case k of
+            GLFW.Key'LeftControl  -> modify $ \s -> s & (mouseButtonLens . mouseHandlingCtrlPressed) .~ (ks == GLFW.KeyState'Pressed)
+            GLFW.Key'RightControl -> modify $ \s -> s & (mouseButtonLens . mouseHandlingCtrlPressed) .~ (ks == GLFW.KeyState'Pressed)
+            GLFW.Key'LeftAlt      -> modify $ \s -> s & (mouseButtonLens . mouseHandlingAltPressed)     .~ (ks == GLFW.KeyState'Pressed)
+            GLFW.Key'RightAlt     -> modify $ \s -> s & (mouseButtonLens . mouseHandlingAltPressed)     .~ (ks == GLFW.KeyState'Pressed)
+            GLFW.Key'LeftSuper    -> modify $ \s -> s & (mouseButtonLens . mouseHandlingSuperPressed)   .~ (ks == GLFW.KeyState'Pressed)
+            GLFW.Key'RightSuper   -> modify $ \s -> s & (mouseButtonLens . mouseHandlingSuperPressed)   .~ (ks == GLFW.KeyState'Pressed)
+            GLFW.Key'LeftShift    -> modify $ \s -> s & (mouseButtonLens . mouseHandlingShiftPressed)   .~ (ks == GLFW.KeyState'Pressed)
+            GLFW.Key'RightShift   -> modify $ \s -> s & (mouseButtonLens . mouseHandlingShiftPressed)   .~ (ks == GLFW.KeyState'Pressed)
+            _ -> return ()
+
+
           when (ks == GLFW.KeyState'Pressed) $ do
               -- Q, Esc: exit
-              when (k == GLFW.Key'Q || k == GLFW.Key'Escape) $
+              when (k == GLFW.Key'Escape) $
                 liftIO $ GLFW.setWindowShouldClose win True
 
       (EventMouseButton _ mb mba mk) -> do
+
         when (mb == GLFW.MouseButton'1) $ do
+            let mouseButtonLens = statePlugins . pluginsMouseHandling . _1 
             case mba of
-                GLFW.MouseButtonState'Pressed -> modify $ \s -> s & stateMouseButtonState .~ PressDown
-                GLFW.MouseButtonState'Released -> modify $ \s -> s & stateMouseButtonState .~ Released
+                GLFW.MouseButtonState'Pressed -> modify $ \s -> s & (mouseButtonLens . mouseHandlingMouseButtonState) .~ MouseHandling.PressDown
+                GLFW.MouseButtonState'Released -> modify $ \s -> s & (mouseButtonLens . mouseHandlingMouseButtonState) .~ MouseHandling.Released
 
             return ()
 
@@ -611,20 +681,20 @@ setViewProjectionMatrix program = do
     projectionLocation <- GL.get (GL.uniformLocation program "projection")
     GL.uniform projectionLocation  GL.$= matProj
 
-insertValueToQuadtree:: [RawAndRenderedObjectPair] -> Demo ()
+insertValueToQuadtree:: [CpuGpuRepPair] -> Demo ()
 insertValueToQuadtree elems = do
     width <- _stateWindowWidth <$> get
     height <- _stateWindowHeight <$> get
     grid <- _stateElementsOnScreen <$> get
     val <- liftIO $ foldrM (\spatialDat t ->
-        let x = spatialDat ^. rawFromPair ^.  objectToRenderPrimitiveObject in
+        let x = spatialDat ^. cpuRep ^.  objectToRenderPrimitiveObject in
         let (corner1, corner2)= toBoundary x in
             SM.appendGridRange (corner1 & both %~ floor) (corner2 & both %~ floor) spatialDat t)
         grid elems
 
     return ()
 
-lookupValueFromTree:: Coord -> Demo [RawAndRenderedObjectPair]
+lookupValueFromTree:: Coord -> Demo [CpuGpuRepPair]
 lookupValueFromTree coord@(px, py) = do
     width <- _stateWindowWidth <$> get
     height <- _stateWindowHeight <$> get
@@ -635,8 +705,8 @@ lookupValueFromTree coord@(px, py) = do
     let numOfVals = length vals
     -- liftIO $ print grid
     -- val <- mapM (\a@SM.SpatialData{SM._spatialData = x} -> do
-    --     let r = x ^. renderedFromPair ^. renderedObjectBuffers
-    --     let obj = x ^. rawFromPair
+    --     let r = x ^. gpuRep ^. renderedObjectBuffers
+    --     let obj = x ^. cpuRep
     --     let d = obj ^. objectToRenderPrimitiveObject
     --     let indexInBuffer = obj ^. objectToRenderIndexWithinBuffer
     --     let primitive = obj ^. objectToRenderPrimitiveObject
@@ -644,7 +714,7 @@ lookupValueFromTree coord@(px, py) = do
     --         let conf = emptyConfig {
     --             _m_backgroundColor = Just $ RGBA (Linear.V4 0 0 1 1), 
     --             _m_translate = Just $ Linear.V3 (toEnum px) (toEnum py) 0 }
-    --         liftIO $ (x ^. renderedFromPair ^. renderedObjectBindConfig) conf 
+    --         liftIO $ (x ^. gpuRep ^. renderedObjectBindConfig) conf 
 
 
     --     return x

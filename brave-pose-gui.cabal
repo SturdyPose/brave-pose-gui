@@ -29,6 +29,8 @@ library
       DataStructures.QuadTree
       Graphics.Primitives
       Graphics.ShaderLoader
+      Inputs.MouseHandling
+      Interpolation.Interpolator
   other-modules:
       Paths_brave_pose_gui
   autogen-modules:
