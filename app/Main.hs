@@ -35,6 +35,7 @@ import Control.Applicative ((<|>))
 import Control.Monad.State.Strict (StateT(runStateT), execStateT)
 import qualified Inputs.MouseHandling as MouseHandling
 import Control.Monad (forM_)
+import Graphics.Fonts
 
 --------------------------------------------------------------------------------
 
@@ -58,10 +59,11 @@ data Event =
 --------------------------------------------------------------------------------
 
 data Env = Env
-    { _envEventsChan   :: TQueue Event
-    , _envWindow       :: !GLFW.Window
-    , _envStateShaders :: !(M.Map B.ByteString GL.Program)
-    , _envTimeStart    :: !SystemTime
+    { _envEventsChan      :: TQueue Event
+    , _envWindow          :: !GLFW.Window
+    , _envStateShaders    :: !(M.Map B.ByteString GL.Program)
+    , _envTimeStart       :: !SystemTime
+    , _envFreeTypeMapping :: !FreeTypeMapping
     }
 
 data CpuGpuRepPair = CpuGpuRepPair {
@@ -170,6 +172,7 @@ createPlugins = do
         , MouseHandling._mouseHandlingEnvInteractables                 = M.empty
         , MouseHandling._mouseHandlingModifierKeys                     = MouseHandling.ModifierKeys False False False False 
         , MouseHandling._mouseHandlingMouseButtonState                 = MouseHandling.None
+        , MouseHandling._mouseHandlingActivated                        = False
     }
 
     let mouseState = MouseHandling.MouseHandlingState {
@@ -240,11 +243,13 @@ main = do
         shaders <- compileShaders
         st <- createState fbWidth fbHeight
         sysTime <- getSystemTime
+        mapping <- initFreeType
         let env = Env
-              { _envEventsChan    = eventsChan
-              , _envWindow        = win
-              , _envStateShaders = shaders
-              , _envTimeStart    = sysTime
+              { _envEventsChan      = eventsChan
+              , _envWindow          = win
+              , _envStateShaders    = shaders
+              , _envTimeStart       = sysTime
+              , _envFreeTypeMapping = mapping
               }
         runDemo env st
 
@@ -326,6 +331,18 @@ startup = do
         ,   _objectToRenderProgram = programInstanced
     } cache3) recs
 
+    mapping <- asks _envFreeTypeMapping
+    let chars = mapping "Hello world, ěščřžýáíéó" "Oswald-Regular.ttf"
+
+    fontShader <- askForShader "FontShaders"
+    let t = Text (Linear.V2 200 200) chars
+    cache4 <- liftIO $ bindToGL t conf2 fontShader 
+
+
+    let chars2 = mapping (show [x | x <- [1..12]]) "ComicNeue-Regular.ttf"
+
+    let t = Text (Linear.V2 200 300) chars2 
+    cache5 <- liftIO $ bindToGL t conf2 fontShader 
     -- isCancelledRef <- liftIO $ newIORef False
     -- let someOnRelease x y = do
     --         m_val <- getFromHashMap uuid2
@@ -390,7 +407,7 @@ startup = do
             return ()
 
                     --  & stateInteractable .~ M.fromList [pair, pair2] ++ pair3
-    modify $ \s -> s & stateRenderedCache .~ V.fromList [cache, cache2, cache3]
+    modify $ \s -> s & stateRenderedCache .~ V.fromList [cache, cache2, cache3, cache4, cache5]
 
     insertToHashMap 
         (
@@ -531,8 +548,6 @@ run = do
 
     cache <- _stateRenderedCache <$> get
 
-    handleMouseEvent
-
     liftIO $ do
         GL.clear [GL.ColorBuffer, GL.DepthBuffer]
 
@@ -569,33 +584,18 @@ printEvent cbname fields =
 
 setMousePos:: Int -> Int -> Demo ()
 setMousePos x y = do
-    modify $ \s -> s & stateMousePos .~ (x,y)
+    state <- get
+    let height = _stateWindowHeight state
+    modify $ \s -> s & stateMousePos .~ (x, height - y)
 
-handleMouseEvent:: Demo ()
-handleMouseEvent = do
-    (x,y) <- _stateMousePos <$> get
-    interactable <- _stateInteractable <$> get
-    -- newInteractable <- forM interactable $ \raw -> do
-    --     let obj = raw ^. cpuRep
-    --     let d = obj ^. objectToRenderPrimitiveObject
+activateMouseHandling:: Demo ()
+activateMouseHandling = do
+    modify $ \s -> s & (statePlugins . pluginsMouseHandling . _1 . mouseHandlingActivated) .~ True
 
-    --     let conf = emptyConfig {
-    --         -- _m_backgroundColor = Just $ RGBA (Linear.V4 0 0 1 1), 
-    --         _m_backgroundColor = Just $ RGBA (Linear.V4 1 1 0 1),
-    --         _m_translate = Just $ Linear.V3 (double2Float x) (double2Float y) 0 }
-    --     if (isPointInsidePolygon (d) (double2Float x, double2Float y)) then do
-    --     -- liftIO $ print x
-    --         let v = raw & (cpuRep . objectToRenderPrimitiveObject) .~ applyConfig d conf
-    --         let iWithinBuffer = obj ^. objectToRenderIndexWithinBuffer
-    --         liftIO $ (raw ^. gpuRep ^. renderedObjectBindConfig) iWithinBuffer conf
-    --         return v
-    --     else 
-    --         return raw 
-
-    -- modify $ \x -> x & stateInteractable .~ newInteractable
-
-    return ()
-
+isMouseHandlingActivated:: Demo Bool
+isMouseHandlingActivated =
+    get >>= \s -> return $ s ^. (statePlugins . pluginsMouseHandling . _1 . mouseHandlingActivated)
+    
 processEvent :: Event -> Demo ()
 processEvent ev =
     case ev of
@@ -626,6 +626,12 @@ processEvent ev =
         -- grid <- _stateElementsOnScreen <$> get
 
         setMousePos (fromEnum x) (fromEnum y)
+        iMHA <- isMouseHandlingActivated
+        -- Because both mouse positions were set at first frame at 0,0 it would cause
+        -- Ray cast from top left corner to somewhere within the canvas
+        unless iMHA $ 
+            modify $ \s -> s & stateMousePosPreviousFrame .~ (fromEnum x, fromEnum y)
+        activateMouseHandling
         -- val <- lookupValueFromTree (floor x,screenHeight - floor y)
 
         return ()
@@ -675,7 +681,7 @@ setViewProjectionMatrix:: GL.Program -> Demo ()
 setViewProjectionMatrix program = do
     (w,h) <- get >>= \s -> return (_stateWindowWidth s, _stateWindowHeight s)
 
-    let proj = Linear.ortho (0) ( (int2Float w)) (int2Float h) (0) (int2Float (-w)) (int2Float w)
+    let proj = Linear.ortho (0) ( (int2Float w)) 0 (int2Float h) (int2Float (-w)) (int2Float w)
     matProj <- liftIO (GL.newMatrix GL.RowMajor $ concatMap toList proj :: IO (GL.GLmatrix GL.GLfloat))
 
     projectionLocation <- GL.get (GL.uniformLocation program "projection")

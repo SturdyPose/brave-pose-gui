@@ -12,7 +12,7 @@ module Graphics.Primitives where
 import qualified Graphics.Rendering.OpenGL as GL
 import qualified Linear
 import Control.Lens (makeLenses, (^.), (%~), (&), (.~))
-import Foreign (withArray, plusPtr, nullPtr, sizeOf, Bits (xor))
+import Foreign (withArray, plusPtr, nullPtr, sizeOf, Bits (xor, shiftL), alloca)
 import Foreign.Ptr (Ptr)
 import GHC.Float (int2Float)
 import Data.Foldable (foldrM, Foldable (toList))
@@ -29,6 +29,9 @@ import GHC.IORef (readIORef)
 import GHC.Generics (U1 (..), type (:*:) (..), K1 (..), M1 (..), Generic (..))
 import Control.Applicative (Alternative ((<|>)))
 import Data.UUID
+import FreeType (FT_Library, FT_Face, ft_Set_Char_Size, ft_Load_Glyph, ft_Get_Char_Index, ft_Set_Pixel_Sizes)
+import Graphics.Fonts 
+import Data.Bits (shiftR, Bits (shift))
 
 floatSize64  = (fromIntegral $ sizeOf (0.0::GL.GLfloat)) :: GL.GLsizeiptr
 floatSize  = (fromIntegral $ sizeOf (0.0::GL.GLfloat)) :: GL.GLsizei
@@ -122,7 +125,7 @@ data BezierLine= BezierLine { _bezierLinePosition:: !(Linear.V2 GL.GLfloat) }
 
 $(makeLenses ''BezierLine)
 
-data Text      = Text       { _textPosition:: !(Linear.V2 GL.GLfloat) }
+data Text      = Text       { _textPosition:: !(Linear.V2 GL.GLfloat), _textFreeTypeChars:: [FreeTypeCharacter]}
   deriving Show
 
 $(makeLenses ''Text)
@@ -237,7 +240,7 @@ instance PolygonShape Rectangle where
 initPixel      = Pixel     { _pixelPosition= Linear.V2 0 0 }
 initLine       = Line      { _linePosition= Linear.V2 0 0 }
 initBezierLine = BezierLine{ _bezierLinePosition= Linear.V2 0 0 }
-initText       = Text      { _textPosition= Linear.V2 0 0 }
+initText ftLib ftFace = Text      { _textPosition= Linear.V2 0 0, _textFreeTypeChars = []}
 initCircle     = Circle    { _circlePosition= Linear.V2 0 0 , _diameter = 1 }
 initRectangle  = Rectangle { _rectanglePosition= Linear.V2 0 0 , _width = 1, _height = 1}
 initEllipse    = Ellipse   { _ellipsePosition= Linear.V2 0 0 }
@@ -336,6 +339,7 @@ scaleMat factorX factorY factorZ = Linear.scaled $ Linear.V4 factorX factorY fac
 primitiveTransformMat:: Primitive -> Linear.M44 Float
 primitiveTransformMat (PrimitiveCircle (Circle (Linear.V2 x y) dia)) = Linear.mkTransformation (Linear.Quaternion 1 (Linear.V3 0 0 0)) (Linear.V3 x y 0) Linear.!*! (scaleMat (dia/2) (dia/2) (dia/2))
 primitiveTransformMat (PrimitiveRectangle (Rectangle (Linear.V2 x y) width height)) = Linear.mkTransformation (Linear.Quaternion 1 (Linear.V3 0 0 0)) (Linear.V3 x y 0) Linear.!*! (scaleMat width height 0)
+primitiveTransformMat (PrimitiveText (Text (Linear.V2 x y) _)) = Linear.mkTransformation (Linear.Quaternion 1 (Linear.V3 0 0 0)) (Linear.V3 x y 0) Linear.!*! (scaleMat 0 0 0)
 primitiveTransformMat _ = error "Because of pattern match above this shouldn't happen, have you bucketed shapes?"
 
 howToUpdate:: Primitive -> Config -> IO ()
@@ -634,6 +638,113 @@ instance PrimitiveShape Circle where
 
 instance PrimitiveShape Rectangle where
   toPrimitive = PrimitiveRectangle
+
+
+instance GLBindable Text where
+  bindToGL :: Text -> Config -> GL.Program -> IO RenderedObject
+  bindToGL t@Text{_textPosition = pos, _textFreeTypeChars = chars} conf program = do
+    vaoName <- GL.genObjectName
+    [vertexBuffer, transformBuffer, colorBuffer] <- GL.genObjectNames 3
+    GL.bindVertexArrayObject GL.$= Just vaoName
+    let stride = 0 * floatSize
+
+    GL.bindBuffer GL.ArrayBuffer GL.$= Just vertexBuffer
+
+    let vPosition  = GL.AttribLocation 0
+    GL.vertexAttribPointer vPosition GL.$=
+        (GL.ToFloat, GL.VertexArrayDescriptor 4 GL.Float stride (bufferOffset (0:: GL.GLsizei)))
+    GL.vertexAttribArray vPosition GL.$= GL.Enabled
+    let sizev = fromIntegral (24 * sizeOf (0:: GL.GLfloat))
+    GL.bufferData GL.ArrayBuffer GL.$= (sizev, nullPtr, GL.DynamicDraw)
+
+    GL.bindBuffer GL.ArrayBuffer GL.$= Nothing
+    GL.bindVertexArrayObject GL.$= Nothing
+    let buffers = GlBuffers {
+        _glBuffersObject           = vaoName
+      , _glBuffersVertexBuffer     = vertexBuffer
+      , _glBuffersColorBuffer      = colorBuffer
+      , _glBuffersTransformBuffer  = transformBuffer
+      , _glProgram                 = program
+    }
+
+    let renderedObject = RenderedObject {
+        _renderedObjectBuffers  = buffers
+      , _renderedObjectCount    = 1
+      , _renderedObjectDrawCall = do
+        GL.blend GL.$= GL.Enabled
+        GL.frontFace GL.$= GL.CW
+        GL.blendFunc GL.$= (GL.SrcAlpha, GL.OneMinusSrcAlpha)
+
+        let Linear.V2 x y = pos
+
+        GL.bindVertexArrayObject GL.$= Just vaoName
+        let colors = maybe (Linear.V4 0 0 0 0) colorTypeToRGBA (conf ^. m_backgroundColor)
+
+        vcolorLoc <- GL.get (GL.uniformLocation program "vcolor")
+        GL.uniform vcolorLoc GL.$= let Linear.V4 r g b a = colors in GL.Vector4 r g b a
+
+        let !transformMat = (primitiveTransformMat . PrimitiveText) t
+
+        let newTransform = maybe transformMat (\vec -> transformMat & Linear.translation .~ vec ) (conf ^. m_translate)
+
+        matTrans <- GL.newMatrix GL.RowMajor $ concatMap toList newTransform:: IO (GL.GLmatrix GL.GLfloat)
+        transformLoc <- GL.get (GL.uniformLocation program "transform")
+        GL.uniform transformLoc  GL.$= matTrans
+
+        -- TODO: Make this into fold, I just don't want to deal with it now
+        uglyStartXRef <- newIORef x
+
+        forM_ chars $ \character -> do
+          let texId = _freeTypeCharacterTextureID character
+          let Linear.V2 charSizeX charSizeY = _freeTypeCharacterSize character
+          let Linear.V2 bearingX bearingY = _freeTypeCharacterBearing character
+          let Linear.V2 advanceX advanceY = _freeTypeCharacterAdvance character
+
+          nextX <- readIORef uglyStartXRef
+
+          let scale = 1
+          let xpos = nextX + int2Float bearingX * scale
+          let ypos = y - int2Float (charSizeY - bearingY) * scale
+          let w = int2Float charSizeX * scale
+          let h = int2Float charSizeY * scale 
+
+          let vertices = [
+                    xpos    , ypos + h, 0, 0
+                  , xpos    , ypos    , 0, 1
+                  , xpos + w, ypos    , 1, 1
+
+                  , xpos    , ypos + h, 0, 0
+                  , xpos + w, ypos    , 1, 1
+                  , xpos + w, ypos + h, 1, 0
+                ]
+
+          GL.textureBinding GL.Texture2D GL.$= Just texId
+          GL.bindBuffer GL.ArrayBuffer GL.$= Just vertexBuffer
+          withArray vertices $ \ptr -> do
+            GL.bufferSubData GL.ArrayBuffer GL.WriteToBuffer 0 (toEnum $ 24 * sizeOf (0:: GL.GLfloat)) ptr
+          GL.bindBuffer GL.ArrayBuffer GL.$= Nothing
+
+          GL.drawArrays GL.Triangles 0 6
+
+
+          modifyIORef uglyStartXRef $ \val -> val + int2Float (advanceX `shiftR` 6) * scale
+
+          return ()
+
+        GL.bindBuffer GL.ArrayBuffer GL.$= Nothing
+        GL.textureBinding GL.Texture2D GL.$= Nothing
+        GL.bindVertexArrayObject GL.$= Nothing
+        
+        GL.blend GL.$= GL.Disabled
+
+      , _renderedObjectProgram  = program
+      , _renderedObjectRebind = \(PrimitiveText t) _ config -> do
+          -- modifyIORef ioRefConfig $ \oldConf -> combine config oldConf
+          -- writeIORef ioRefCirc cir
+          return ()
+    }
+
+    return renderedObject
 
 
 coords:: Primitive -> Linear.V2 Float

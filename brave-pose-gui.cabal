@@ -27,6 +27,7 @@ library
   exposed-modules:
       DataStructures.IOSpatialMap
       DataStructures.QuadTree
+      Graphics.Fonts
       Graphics.Primitives
       Graphics.ShaderLoader
       Inputs.MouseHandling
@@ -47,6 +48,8 @@ library
     , bytestring
     , containers
     , directory
+    , filepath
+    , freetype2
     , lens
     , linear
     , mtl
@@ -77,6 +80,8 @@ executable brave-pose-gui-exe
     , bytestring
     , containers
     , directory
+    , filepath
+    , freetype2
     , lens
     , linear
     , mtl
@@ -108,6 +113,8 @@ test-suite brave-pose-gui-test
     , bytestring
     , containers
     , directory
+    , filepath
+    , freetype2
     , lens
     , linear
     , mtl

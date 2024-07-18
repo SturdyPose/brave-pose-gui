@@ -37,6 +37,8 @@ dependencies:
 - directory
 - time
 - uuid
+- freetype2
+- filepath
 
 ghc-options:
 - -Wall

@@ -16,10 +16,10 @@ data MouseButtonState = PressDown | Pressed | Released | None
 data MouseButton = Left | Right | Middle | Other Int
 
 data ModifierKeys = ModifierKeys {
-      _mouseHandlingAltPressed                       :: Bool
-    , _mouseHandlingCtrlPressed                      :: Bool
-    , _mouseHandlingShiftPressed                     :: Bool
-    , _mouseHandlingSuperPressed                     :: Bool
+      _mouseHandlingAltPressed                       :: !Bool
+    , _mouseHandlingCtrlPressed                      :: !Bool
+    , _mouseHandlingShiftPressed                     :: !Bool
+    , _mouseHandlingSuperPressed                     :: !Bool
 } deriving Show
 
 data MouseHandlingEnv m a = MouseHandlingEnv
@@ -29,6 +29,7 @@ data MouseHandlingEnv m a = MouseHandlingEnv
         , _mouseHandlingEnvInteractables                 :: !(M.Map String (Interactable a, MouseHandlingEvents m a))
         , _mouseHandlingMouseButtonState                 :: !MouseButtonState
         , _mouseHandlingModifierKeys                     :: !ModifierKeys
+        , _mouseHandlingActivated                        :: !Bool
     }
 
 data Interactable a where
@@ -89,7 +90,7 @@ emptyEvent = return $ MouseHandlingEvents {
 }
 
 -- This is output to the env for the next frame
-processMouseEvents:: (Monad m, PolygonShape a) => MouseHandlingPlugin m a ()
+processMouseEvents:: (MonadIO m, PolygonShape a) => MouseHandlingPlugin m a ()
 processMouseEvents = do
     mouseState <- _mouseHandlingMouseButtonState <$> ask 
     interactables <- _mouseHandlingEnvInteractables <$> ask
@@ -105,14 +106,14 @@ processMouseEvents = do
         let elem = interactableElement interactable
         let id = interactableId interactable
 
-        let pointStillInPolygon = (isPointInsidePolygon elem (int2Float mouseX, int2Float mouseY)) 
-        let previousPointStillInPolygon = (isPointInsidePolygon elem (int2Float previousMouseX, int2Float previousMouseY))
+        let pointStillInPolygon = isPointInsidePolygon elem (int2Float mouseX, int2Float mouseY) 
+        let previousPointStillInPolygon = isPointInsidePolygon elem (int2Float previousMouseX, int2Float previousMouseY)
 
         if pointStillInPolygon && not previousPointStillInPolygon then do
             -- Mouse entered the object
             lift $ (_onMiceEnter events) (mouseX, mouseY) modifierKeys (elem,events) id
             return ()
-        else if (pointStillInPolygon && previousPointStillInPolygon) then do
+        else if pointStillInPolygon && previousPointStillInPolygon then do
             let isElementPresentInPreviousFrame = M.member id interactableMap
             -- Mouse is somewhere withing the object 
             when (mouseX /= previousMouseX || mouseY /= previousMouseY) $ 
@@ -142,6 +143,8 @@ processMouseEvents = do
         -- Check if mouse quickly goes quickly through the object in single frame
         when (rayIntersectsPolygon elem (Linear.V2 (int2Float previousMouseX) (int2Float previousMouseY)) (Linear.V2 (int2Float mouseX) (int2Float mouseY))) $ do
             when (not pointStillInPolygon && not previousPointStillInPolygon) $ do
+                -- TODO: Maybe queue on leave so it has time to render on next frame
+                -- This needs some experimentation
                 lift $ (_onMiceEnter events) (mouseX, mouseY) modifierKeys (elem,events) id
                 lift $ (_onMiceLeave events) (mouseX, mouseY) modifierKeys (elem,events) id
         
