@@ -2,14 +2,8 @@
 
 module Graphics.Fonts where 
 import Data.Foldable (foldrM)
-import Data.ByteString (ByteString, split, splitWith)
-import qualified Data.Vector as V
 import Foreign (alloca, Storable (..))
-import FreeType (FT_ULong, ft_Done_Face)
 import qualified Linear.V2 as Linear
-import Data.Word (Word32)
-import Data.Int (Int32, Int64)
-import Graphics.GL (glGenTextures, glBindTexture)
 import qualified Graphics.Rendering.OpenGL as GL
 import FreeType 
 import qualified Data.Map.Strict as M
@@ -23,6 +17,7 @@ type FontPath = String
 data FreeTypeCharacter = FreeTypeCharacter {
     -- https://learnopengl.com/In-Practice/Text-Rendering
       _freeTypeCharacterTextureID :: !GL.TextureObject
+    , _freeTypeCharacterCode      :: !Char
     , _freeTypeCharacterSize      :: !(Linear.V2 Int)
     , _freeTypeCharacterBearing   :: !(Linear.V2 Int)
     , _freeTypeCharacterAdvance   :: !(Linear.V2 Int)
@@ -35,7 +30,7 @@ initLoadFontFileGL path lib = do
     ft_Set_Pixel_Sizes face 0 48
 
     ft_Select_Charmap face FT_ENCODING_UNICODE
-    (charCode, glyphIndex) <- ft_Get_Next_Char face Nothing
+    (charCode, _) <- ft_Get_Next_Char face Nothing
 
     ft_Load_Char face charCode FT_LOAD_RENDER
 
@@ -56,6 +51,7 @@ initLoadFontFileGL path lib = do
 
     let freeTypeChar = FreeTypeCharacter {
           _freeTypeCharacterTextureID = texture
+        , _freeTypeCharacterCode      = toEnum . fromEnum $ charCode
         , _freeTypeCharacterSize      = Linear.V2 ((toEnum . fromEnum) (bWidth bitmapVal)) ((toEnum . fromEnum) (bRows bitmapVal))
         , _freeTypeCharacterBearing   = Linear.V2 ((toEnum . fromEnum) (gsrBitmap_left glyphVal)) ((toEnum . fromEnum) (gsrBitmap_top glyphVal))
         , _freeTypeCharacterAdvance   = Linear.V2 ((toEnum . fromEnum) ((vX . gsrAdvance) glyphVal)) ((toEnum . fromEnum) ((vY . gsrAdvance) glyphVal))
@@ -74,7 +70,7 @@ initLoadFontFileGL path lib = do
     where 
         glyphsAndFaces:: FT_Face -> FT_ULong -> [(FT_ULong, FreeTypeCharacter)] -> IO [(FT_ULong, FreeTypeCharacter)]
         glyphsAndFaces face previousCharCode acc = do
-            (charCode, glyphIndex) <- ft_Get_Next_Char face (Just previousCharCode) 
+            (charCode, _) <- ft_Get_Next_Char face (Just previousCharCode) 
             if charCode /= 0 
                 then do 
                     ft_Load_Char face charCode FT_LOAD_RENDER
@@ -94,6 +90,7 @@ initLoadFontFileGL path lib = do
 
                     let freeTypeChar = FreeTypeCharacter {
                           _freeTypeCharacterTextureID = newTex 
+                        , _freeTypeCharacterCode      = toEnum . fromEnum $ charCode
                         , _freeTypeCharacterSize      = Linear.V2 ((toEnum . fromEnum) (bWidth bitmapVal)) ((toEnum . fromEnum) (bRows bitmapVal))
                         , _freeTypeCharacterBearing   = Linear.V2 ((toEnum . fromEnum) (gsrBitmap_left glyphVal)) ((toEnum . fromEnum) (gsrBitmap_top glyphVal))
                         , _freeTypeCharacterAdvance   = Linear.V2 ((toEnum . fromEnum) ((vX . gsrAdvance) glyphVal)) ((toEnum . fromEnum) ((vY . gsrAdvance) glyphVal))
@@ -121,3 +118,11 @@ initFreeType = do
     return $ \inputString fontName -> case M.lookup fontName resMap of
                                         Nothing -> error "This font doesn't exist"
                                         Just mapper -> mapper inputString
+
+formatEscapeChars:: Float -> [FreeTypeCharacter] -> [FreeTypeCharacter]
+formatEscapeChars lineHeight chars = foldr helper [] chars
+    where 
+        helper:: FreeTypeCharacter -> [FreeTypeCharacter] -> [FreeTypeCharacter]
+        helper FreeTypeCharacter{_freeTypeCharacterCode = '\n' } acc = acc
+        helper FreeTypeCharacter{_freeTypeCharacterCode = '\t' } acc = acc
+        helper ftc acc = acc
