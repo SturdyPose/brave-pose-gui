@@ -36,6 +36,7 @@ import Control.Monad.State.Strict (StateT(runStateT), execStateT)
 import qualified Inputs.MouseHandling as MouseHandling
 import Control.Monad (forM_)
 import Graphics.Fonts
+import StrictTypes.Tuples (Pair (..))
 
 --------------------------------------------------------------------------------
 
@@ -83,14 +84,16 @@ $(makeLenses ''CpuGpuRepPair)
 
 type Demo = RWST Env () State IO
 
+
+
 data State = State
     { _stateWindowWidth           :: !Int
     , _stateWindowHeight          :: !Int
     , _stateElementsOnScreen      :: !(SM.IOSpatialMap CpuGpuRepPair)
     , _stateRenderedCache         :: !(V.Vector RenderedObject)
     , _stateInteractable          :: !(M.Map String (MouseHandlingType, MouseHandling.MouseHandlingEvents Demo MouseHandlingType))
-    , _stateMousePos              :: !(Int, Int)
-    , _stateMousePosPreviousFrame :: !(Int, Int)
+    , _stateMousePos              :: !(Pair Int Int)
+    , _stateMousePosPreviousFrame :: !(Pair Int Int)
     , _stateMouseButtonState      :: !MouseHandling.MouseButtonState
     , _stateFrameCounter          :: !Double
     , _stateCurrentSysTime        :: !SystemTime
@@ -100,8 +103,8 @@ data State = State
 
 data Plugins = Plugins
     {
-          _pluginsInterpolation:: !(Interp.InterpolationEnv, Interp.InterpolationState Demo)
-        , _pluginsMouseHandling:: !(MouseHandling.MouseHandlingEnv Demo MouseHandlingType, MouseHandling.MouseHandlingState MouseHandlingType)
+          _pluginsInterpolation:: !(Pair Interp.InterpolationEnv (Interp.InterpolationState Demo))
+        , _pluginsMouseHandling:: !(Pair (MouseHandling.MouseHandlingEnv Demo MouseHandlingType) (MouseHandling.MouseHandlingState MouseHandlingType))
     }
 
 type MouseHandlingType = CpuGpuRepPair
@@ -129,7 +132,7 @@ insertToHashMap pair@(i, events) = do
     let handlingLens = pluginsMouseHandling . _1 . mouseHandlingEnvInteractables
     modify $ \s -> s & (statePlugins . handlingLens) %~ \m -> M.insert (MouseHandling.interactableId i) pair m
 
-    return()
+    return ()
 
 
 createState:: Int -> Int -> IO State
@@ -146,8 +149,8 @@ createState width height = do
         , _stateElementsOnScreen      = spatialMap
         , _stateRenderedCache         = V.empty
         , _stateInteractable          = M.empty
-        , _stateMousePos              = (0,0)
-        , _stateMousePosPreviousFrame = (0,0)
+        , _stateMousePos              = Pair 0 0
+        , _stateMousePosPreviousFrame = Pair 0 0
         , _stateMouseButtonState      = MouseHandling.None
         , _stateFrameCounter          = 0
         , _stateCurrentSysTime        = sysTime
@@ -162,15 +165,15 @@ createPlugins = do
             Interp._interpolationEnvTime = sysTime
         }
 
-    let interpState = Interp.InterpolationState { 
+    let interpState = Interp.InterpolationState {
             Interp._interpolationStateInterpolators = []
         }
 
     let mouseEnv = MouseHandling.MouseHandlingEnv {
-          MouseHandling._mouseHandlingEnvMouseCoordinates              = (0,0) 
-        , MouseHandling._mouseHandlingEnvMouseCoordinatesPreviousFrame = (0,0)
+          MouseHandling._mouseHandlingEnvMouseCoordinates              = Pair 0 0
+        , MouseHandling._mouseHandlingEnvMouseCoordinatesPreviousFrame = Pair 0 0
         , MouseHandling._mouseHandlingEnvInteractables                 = M.empty
-        , MouseHandling._mouseHandlingModifierKeys                     = MouseHandling.ModifierKeys False False False False 
+        , MouseHandling._mouseHandlingModifierKeys                     = MouseHandling.ModifierKeys False False False False
         , MouseHandling._mouseHandlingMouseButtonState                 = MouseHandling.None
         , MouseHandling._mouseHandlingActivated                        = False
     }
@@ -179,10 +182,10 @@ createPlugins = do
           MouseHandling._mouseHandlingStateActiveInteractables = M.empty
         , MouseHandling._mouseHandlingPreviousMouseState       = MouseHandling.None
     }
-    
+
     return Plugins {
-          _pluginsInterpolation = (interpEnv, interpState)
-        , _pluginsMouseHandling = (mouseEnv, mouseState)
+          _pluginsInterpolation = Pair interpEnv interpState
+        , _pluginsMouseHandling = Pair mouseEnv mouseState
     }
 
 
@@ -200,14 +203,14 @@ updatePluginInputs = do
     -- mouseHandlingEvents <- MouseHandling.emptyEvent
     -- let ints = map 
     --         (\(id, interactable) -> (MouseHandling.Interactable (interactable ^. cpuRep) (show id), mouseHandlingEvents)) $ M.toList (s ^. stateInteractable)
-    
+
     let previousMouseEnv = s ^. (statePlugins . pluginsMouseHandling . _1)
     let mouseEnv = previousMouseEnv {
           MouseHandling._mouseHandlingEnvMouseCoordinates              = s ^. stateMousePos
         , MouseHandling._mouseHandlingEnvMouseCoordinatesPreviousFrame = s ^. stateMousePosPreviousFrame
     }
 
-    modify $ \s -> s & (statePlugins . pluginsMouseHandling . _1 ) .~ mouseEnv 
+    modify $ \s -> s & (statePlugins . pluginsMouseHandling . _1 ) .~ mouseEnv
 
     return ()
 
@@ -258,22 +261,22 @@ main = do
 --------------------------------------------------------------------------------
 
 processInnerStateMonad:: Interp.InterpolationPlugin Demo a -> Demo a
-processInnerStateMonad plugin = do 
-    (env, previousState) <- ( _pluginsInterpolation . _statePlugins ) <$> get 
-    (a, r, _) <- runRWST plugin env previousState 
+processInnerStateMonad plugin = do
+    (Pair env previousState) <- ( _pluginsInterpolation . _statePlugins ) <$> get
+    (a, r, _) <- runRWST plugin env previousState
     -- Monad within clicking can change environment variable
-    (envNew, _) <- ( _pluginsInterpolation . _statePlugins ) <$> get 
-    modify $ \s -> s & (statePlugins . pluginsInterpolation) .~ (envNew, r)
+    (Pair envNew _) <- ( _pluginsInterpolation . _statePlugins ) <$> get
+    modify $ \s -> s & (statePlugins . pluginsInterpolation) .~ (Pair envNew r)
     return a
 
 
 processInnerStateMonadMouse:: MouseHandling.MouseHandlingPlugin Demo MouseHandlingType b -> Demo b
-processInnerStateMonadMouse plugin = do 
-    (env, previousState) <- ( _pluginsMouseHandling . _statePlugins ) <$> get 
-    (a, r, _) <- runRWST plugin env previousState 
+processInnerStateMonadMouse plugin = do
+    (Pair env previousState) <- ( _pluginsMouseHandling . _statePlugins ) <$> get
+    (a, r, _) <- runRWST plugin env previousState
     -- Monad within clicking can change environment variable
-    (envNew, _) <- ( _pluginsMouseHandling . _statePlugins ) <$> get 
-    modify $ \s -> s & (statePlugins . pluginsMouseHandling) .~ (envNew, r)
+    (Pair envNew _) <- ( _pluginsMouseHandling . _statePlugins ) <$> get
+    modify $ \s -> s & (statePlugins . pluginsMouseHandling) .~ (Pair envNew r)
     return a
 
 startup:: Demo ()
@@ -321,13 +324,13 @@ startup = do
 
     cache3 <- liftIO $ bindInstancedToGL recs conf2 programInstanced
 
-    pair3 <- imapM (\i rect -> do 
+    pair3 <- imapM (\i rect -> do
         uuid3 <- liftIO nextRandom
         return $ CpuGpuRepPair ObjectToRender {
             _objectToRenderPrimitiveObject = toPrimitive rect
         ,   _objectToRenderConfig = conf2
         ,   _objectToRenderIndexWithinBuffer = i
-        ,   _objectToRenderID = "a" ++ show i 
+        ,   _objectToRenderID = "a" ++ show i
         ,   _objectToRenderProgram = programInstanced
     } cache3) recs
 
@@ -336,13 +339,13 @@ startup = do
 
     fontShader <- askForShader "FontShaders"
     let t = Text (Linear.V2 200 200) chars
-    cache4 <- liftIO $ bindToGL t conf2 fontShader 
+    cache4 <- liftIO $ bindToGL t conf2 fontShader
 
 
     let chars2 = mapping (show [x | x <- [1..12]]) "ComicNeue-Regular.ttf"
 
-    let t = Text (Linear.V2 200 300) chars2 
-    cache5 <- liftIO $ bindToGL t conf2 fontShader 
+    let t = Text (Linear.V2 200 300) chars2
+    cache5 <- liftIO $ bindToGL t conf2 fontShader
     -- isCancelledRef <- liftIO $ newIORef False
     -- let someOnRelease x y = do
     --         m_val <- getFromHashMap uuid2
@@ -387,7 +390,7 @@ startup = do
             -- let m_objToFollow = (_objectToRenderPrimitiveObject . _cpuRep) <$> m_valToFollow
             -- let defaultOrAlreadyExisting = fromMaybe (toPrimitive thing) m_obj
             -- let defaultOrAlreadyExistingFollow = fromMaybe (toPrimitive thing2) m_objToFollow
-            let floatX = int2Float x 
+            let floatX = int2Float x
             let floatY = int2Float y
 
             -- let coordinatesToFollow = coords defaultOrAlreadyExistingFollow
@@ -395,9 +398,9 @@ startup = do
             processInnerStateMonad $ Interp.lerp2 1200 (Linear.V2 floatX floatY) (Linear.V2 (floatX + 100) (floatY + 100)) $ \vec -> do
                 -- let conf = emptyConfig { _m_translate = Just $ (Linear.V3 a b 0)}
                 let newV = case element ^. (cpuRep . objectToRenderPrimitiveObject) of
-                        (PrimitiveCircle (Circle t d)) -> PrimitiveCircle $ Circle vec d 
+                        (PrimitiveCircle (Circle t d)) -> PrimitiveCircle $ Circle vec d
                         _ -> newV
-                let v = element & (cpuRep . objectToRenderPrimitiveObject) .~ newV 
+                let v = element & (cpuRep . objectToRenderPrimitiveObject) .~ newV
                 -- insertToHashMap $ (applyConfig element conf, mouseHandlingEvents & onMiceClicks .~ someOnClick)
                 -- let iWithinBuffer = obj ^. objectToRenderIndexWithinBuffer
                 -- insertToHashMap (MouseHandling.Interactable pair2 "2", mouseHandlingEvents & onMiceClicks .~ someOnClick)
@@ -409,9 +412,9 @@ startup = do
                     --  & stateInteractable .~ M.fromList [pair, pair2] ++ pair3
     modify $ \s -> s & stateRenderedCache .~ V.fromList [cache, cache2, cache3, cache4, cache5]
 
-    insertToHashMap 
+    insertToHashMap
         (
-            MouseHandling.Interactable pair2 "2", 
+            MouseHandling.Interactable pair2 "2",
             mouseHandlingEvents & onMiceClicks .~ someOnClick
                                 & onMiceMove .~ onMouseMove
                                 & onMiceEnter .~ onHover
@@ -425,7 +428,7 @@ startup = do
 
 onHover :: (a, b) -> p -> (CpuGpuRepPair, MouseHandling.MouseHandlingEvents Demo MouseHandlingType) -> String -> Demo ()
 onHover (x,y) modKeys (element, elementEvents) id = do
-    let conf = emptyConfig { 
+    let conf = emptyConfig {
         _m_backgroundColor = Just $ RGBA (Linear.V4 1 0 0 1)}
 
     let newV = case element ^. (cpuRep . objectToRenderPrimitiveObject) of
@@ -440,7 +443,7 @@ onHover (x,y) modKeys (element, elementEvents) id = do
 
 onHoverOut :: (a, b) -> p -> (CpuGpuRepPair, MouseHandling.MouseHandlingEvents Demo MouseHandlingType) -> String -> Demo ()
 onHoverOut (x,y) modKeys (element, elementEvents) id = do
-    let conf = emptyConfig { 
+    let conf = emptyConfig {
             _m_backgroundColor = Just $ RGBA (Linear.V4 0 1 0 1)}
 
     let newV = case element ^. (cpuRep . objectToRenderPrimitiveObject) of
@@ -586,7 +589,7 @@ setMousePos:: Int -> Int -> Demo ()
 setMousePos x y = do
     state <- get
     let height = _stateWindowHeight state
-    modify $ \s -> s & stateMousePos .~ (x, height - y)
+    modify $ \s -> s & stateMousePos .~ (Pair x (height - y))
 
 activateMouseHandling:: Demo ()
 activateMouseHandling = do
@@ -595,7 +598,7 @@ activateMouseHandling = do
 isMouseHandlingActivated:: Demo Bool
 isMouseHandlingActivated =
     get >>= \s -> return $ s ^. (statePlugins . pluginsMouseHandling . _1 . mouseHandlingActivated)
-    
+
 processEvent :: Event -> Demo ()
 processEvent ev =
     case ev of
@@ -629,8 +632,8 @@ processEvent ev =
         iMHA <- isMouseHandlingActivated
         -- Because both mouse positions were set at first frame at 0,0 it would cause
         -- Ray cast from top left corner to somewhere within the canvas
-        unless iMHA $ 
-            modify $ \s -> s & stateMousePosPreviousFrame .~ (fromEnum x, fromEnum y)
+        unless iMHA $
+            modify $ \s -> s & stateMousePosPreviousFrame .~ (Pair (fromEnum x) (fromEnum y))
         activateMouseHandling
         -- val <- lookupValueFromTree (floor x,screenHeight - floor y)
 
@@ -659,7 +662,7 @@ processEvent ev =
       (EventMouseButton _ mb mba mk) -> do
 
         when (mb == GLFW.MouseButton'1) $ do
-            let mouseButtonLens = statePlugins . pluginsMouseHandling . _1 
+            let mouseButtonLens = statePlugins . pluginsMouseHandling . _1
             case mba of
                 GLFW.MouseButtonState'Pressed -> modify $ \s -> s & (mouseButtonLens . mouseHandlingMouseButtonState) .~ MouseHandling.PressDown
                 GLFW.MouseButtonState'Released -> modify $ \s -> s & (mouseButtonLens . mouseHandlingMouseButtonState) .~ MouseHandling.Released

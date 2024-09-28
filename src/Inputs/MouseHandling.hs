@@ -9,6 +9,7 @@ import qualified Linear
 import Control.Monad.RWS.Strict 
 import qualified Data.Map.Strict as M
 import Control.Lens 
+import StrictTypes.Tuples (Pair (..))
 
 data MouseButtonState = PressDown | Pressed | Released | None
     deriving (Show, Eq)
@@ -24,8 +25,8 @@ data ModifierKeys = ModifierKeys {
 
 data MouseHandlingEnv m a = MouseHandlingEnv
     {
-          _mouseHandlingEnvMouseCoordinates              :: !(Int, Int)
-        , _mouseHandlingEnvMouseCoordinatesPreviousFrame :: !(Int, Int)
+          _mouseHandlingEnvMouseCoordinates              :: !(Pair Int Int)
+        , _mouseHandlingEnvMouseCoordinatesPreviousFrame :: !(Pair Int Int)
         , _mouseHandlingEnvInteractables                 :: !(M.Map String (Interactable a, MouseHandlingEvents m a))
         , _mouseHandlingMouseButtonState                 :: !MouseButtonState
         , _mouseHandlingModifierKeys                     :: !ModifierKeys
@@ -95,8 +96,8 @@ processMouseEvents = do
     mouseState <- _mouseHandlingMouseButtonState <$> ask 
     interactables <- _mouseHandlingEnvInteractables <$> ask
     modifierKeys <- _mouseHandlingModifierKeys <$> ask
-    (mouseX, mouseY) <- _mouseHandlingEnvMouseCoordinates <$> ask 
-    (previousMouseX, previousMouseY) <- _mouseHandlingEnvMouseCoordinatesPreviousFrame <$> ask 
+    (Pair mouseX mouseY) <- _mouseHandlingEnvMouseCoordinates <$> ask 
+    (Pair previousMouseX previousMouseY) <- _mouseHandlingEnvMouseCoordinatesPreviousFrame <$> ask 
     interactableMap <- _mouseHandlingStateActiveInteractables <$> get
     previousMouseButtonState <- _mouseHandlingPreviousMouseState <$> get
 
