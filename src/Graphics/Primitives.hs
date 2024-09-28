@@ -69,13 +69,41 @@ data Events = MouseHoverIn | MouseHoverOut
 data Config = Config {
       _m_backgroundColor :: Maybe ColorType
     , _m_color           :: Maybe ColorType
+    , _m_dimensions      :: Maybe (Linear.V4 Float)
+    , _m_scale           :: Maybe (Linear.V3 Float)
+    , _m_translate       :: Maybe (Linear.V3 Float)
 } deriving (Show, Eq, Ord, Generic)
 
 emptyConfig:: Config
 emptyConfig = Config {
     _m_backgroundColor = Nothing
   , _m_color           = Nothing
+  , _m_dimensions      = Nothing
+  , _m_scale           = Nothing
+  , _m_translate       = Nothing
 }
+
+class GCombine f where
+  gCombine :: f p -> f p -> f p
+
+instance GCombine U1 where
+  gCombine U1 U1 = U1
+
+instance (GCombine a, GCombine b) => GCombine (a :*: b) where
+  gCombine (a1 :*: b1) (a2 :*: b2) = gCombine a1 a2 :*: gCombine b1 b2
+
+instance (Alternative f) => GCombine (K1 i (f a)) where
+  gCombine (K1 a) (K1 b) = K1 (a <|> b)
+
+instance (GCombine a) => GCombine (M1 i c a) where
+  gCombine (M1 a) (M1 b) = M1 (gCombine a b)
+
+class Combine a where
+  combine :: a -> a -> a
+  default combine :: (Generic a, GCombine (Rep a)) => a -> a -> a
+  combine x y = to $ gCombine (from x) (from y)
+
+instance Combine Config
 
 $(makeLenses ''Config)
 
@@ -144,6 +172,7 @@ class PrimitiveShape a where
 class Show a => PolygonShape a where
   toPolygon:: a -> Polygon
   toBoundary:: a -> Boundary
+  applyConfig:: a -> Config -> a
 
 instance PolygonShape Primitive where
   toPolygon (PrimitiveCircle      x) = toPolygon x
@@ -166,6 +195,15 @@ instance PolygonShape Primitive where
   toBoundary (PrimitiveTriangle    x) = error "Not implemented"
   toBoundary (PrimitivePoly        x) = toBoundary x
 
+  applyConfig (PrimitiveCircle      x) conf = PrimitiveCircle $ applyConfig x conf
+  applyConfig (PrimitiveRectangle   x) conf = PrimitiveRectangle $ applyConfig x conf
+  applyConfig (PrimitivePixel       x) conf = error "Not implemented"
+  applyConfig (PrimitiveLine        x) conf = error "Not implemented"
+  applyConfig (PrimitiveBezierLine  x) conf = error "Not implemented"
+  applyConfig (PrimitiveText        x) conf = error "Not implemented"
+  applyConfig (PrimitiveEllipse     x) conf = error "Not implemented"
+  applyConfig (PrimitiveTriangle    x) conf = error "Not implemented"
+  applyConfig (PrimitivePoly        x) conf = error "Not implemented"
 
 instance PolygonShape Polygon where
   -- CCW polygons, always check if polygons are ccw
@@ -176,11 +214,27 @@ instance PolygonShape Circle where
   toPolygon (Circle {_circlePosition = Linear.V2 x y, _diameter = d}) = Polygon { _points = genCirclePoints (x,y) d }
   toBoundary Circle{_circlePosition = (Linear.V2 x y), _diameter = d} = ((x - d/2, y - d/2), (x + d/2, y + d/2))
 
+  applyConfig circ@Circle{_circlePosition = pos, _diameter = d} conf =
+    case conf of
+      Config { _m_translate = Just trans, _m_scale = Just v } -> Circle {_circlePosition = trans ^. Linear._xy, _diameter = v  ^. Linear._x }
+      Config { _m_scale = Just v } -> circ{_diameter = v  ^. Linear._x }
+      Config { _m_translate = Just trans } -> circ{_circlePosition = trans ^. Linear._xy}
+      c -> circ
+
 
 instance PolygonShape Rectangle where
   toPolygon (Rectangle  {_rectanglePosition = Linear.V2 x y, _width = w, _height = h }) = Polygon
     { _points= V.fromList [Linear.V2 x y, Linear.V2 (x + w) y, Linear.V2 (x + w) (y + h), Linear.V2 x (y + h) ]}
   toBoundary Rectangle{_rectanglePosition = (Linear.V2 x y), _width = w, _height = h} = ((x, y), (x + w, y + h))
+
+  applyConfig rect conf = rect
+    -- case conf of 
+    --   Config { _m_translate = Just trans, _m_scale = Just v } -> Circle {_circlePosition = trans ^. Linear._xy, _diameter = v  ^. Linear._x }
+    --   Config { _m_scale = Just v } -> circ{_diameter = v  ^. Linear._x }
+    --   Config { _m_translate = Just trans } -> circ{_circlePosition = trans ^. Linear._xy}
+    --   c -> circ
+
+  -- toPolygon _             = error "Not implemented"
 
 
 initPixel      = Pixel     { _pixelPosition= Linear.V2 0 0 }
@@ -238,6 +292,7 @@ data GLBuffers = GlBuffers {
 } deriving Show
 (makeLenses ''GLBuffers)
 
+
   
 data RenderedObject = RenderedObject {
     _renderedObjectBuffers     :: !GLBuffers
@@ -259,8 +314,24 @@ data ObjectToRender = ObjectToRender {
 instance PolygonShape ObjectToRender where
   toPolygon ObjectToRender{_objectToRenderPrimitiveObject=p } = toPolygon p
   toBoundary ObjectToRender{_objectToRenderPrimitiveObject=p } = toBoundary p
+  applyConfig o@ObjectToRender{_objectToRenderPrimitiveObject=p } c = 
+    o{ 
+        _objectToRenderPrimitiveObject = applyConfig p c
+      , _objectToRenderConfig          = c
+     }
 
 (makeLenses ''ObjectToRender)
+
+
+instancedRenderingFromCache:: GL.Program -> RenderedObject -> IO RenderedObject
+instancedRenderingFromCache program obj@RenderedObject{} = do
+  let vaoName = obj ^. renderedObjectBuffers ^. glBuffersObject
+  GL.bindVertexArrayObject GL.$= Just vaoName
+  obj ^. renderedObjectDrawCall
+
+  GL.bindVertexArrayObject GL.$= Nothing
+  return obj
+
 
 scaleMat :: Num a => a -> a -> a -> Linear.V4 (Linear.V4 a)
 scaleMat factorX factorY factorZ = Linear.scaled $ Linear.V4 factorX factorY factorZ 1
@@ -274,6 +345,7 @@ primitiveTransformMat _ = error "Because of pattern match above this shouldn't h
 howToUpdate:: Primitive -> Config -> IO ()
 howToUpdate _ conf = do
   return ()
+
 
 -- Raycasting algorithm
 isPointInsidePolygon:: PolygonShape a => a -> (Float, Float) -> Bool
@@ -545,16 +617,16 @@ instance GLBindable Circle where
 
         let !transformMat = (primitiveTransformMat . PrimitiveCircle) circle
 
-        -- let newTransform = maybe transformMat (\vec -> transformMat & Linear.translation .~ vec ) (config ^. m_translate)
+        let newTransform = maybe transformMat (\vec -> transformMat & Linear.translation .~ vec ) (config ^. m_translate)
 
-        matTrans <- GL.newMatrix GL.RowMajor $ concatMap toList transformMat:: IO (GL.GLmatrix GL.GLfloat)
+        matTrans <- GL.newMatrix GL.RowMajor $ concatMap toList newTransform:: IO (GL.GLmatrix GL.GLfloat)
         transformLoc <- GL.get (GL.uniformLocation program "transform")
         GL.uniform transformLoc  GL.$= matTrans
 
         GL.drawArrays GL.TriangleFan 0 $ toEnum numOfCirclePointsInGL
       , _renderedObjectProgram  = program
       , _renderedObjectRebind = \(PrimitiveCircle cir) _ config -> do
-          writeIORef ioRefConfig config 
+          modifyIORef ioRefConfig $ \oldConf -> combine config oldConf
           writeIORef ioRefCirc cir
           return ()
     }
@@ -613,9 +685,9 @@ instance GLBindable Text where
 
         let !transformMat = (primitiveTransformMat . PrimitiveText) t
 
-        -- let newTransform = maybe transformMat (\vec -> transformMat & Linear.translation .~ vec ) (conf ^. m_translate)
+        let newTransform = maybe transformMat (\vec -> transformMat & Linear.translation .~ vec ) (conf ^. m_translate)
 
-        matTrans <- GL.newMatrix GL.RowMajor $ concatMap toList transformMat:: IO (GL.GLmatrix GL.GLfloat)
+        matTrans <- GL.newMatrix GL.RowMajor $ concatMap toList newTransform:: IO (GL.GLmatrix GL.GLfloat)
         transformLoc <- GL.get (GL.uniformLocation program "transform")
         GL.uniform transformLoc  GL.$= matTrans
 

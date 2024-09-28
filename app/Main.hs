@@ -7,27 +7,35 @@ module Main (main) where
 --------------------------------------------------------------------------------
 
 import Control.Concurrent.STM    (TQueue, atomically, newTQueueIO, tryReadTQueue, writeTQueue)
+import Control.Monad             (unless, when, void, forM)
+import Control.Monad.RWS.Strict  (RWST, asks, evalRWST, runRWST, get, liftIO, modify)
+
 import qualified Graphics.Rendering.OpenGL as GL
 import qualified Graphics.UI.GLFW          as GLFW
 import qualified Data.Map.Strict as M
+import qualified Data.HashMap.Strict as HM
 import qualified Data.ByteString as B
 import qualified Interpolation.Interpolator as Interp
 import Graphics.Primitives
 import Graphics.ShaderLoader
 import qualified Linear
 import Data.Foldable (toList, foldrM)
+import GHC.Float (int2Float, double2Float, castWord32ToFloat, castFloatToWord32)
 import Control.Lens
 import DataStructures.QuadTree
 import qualified DataStructures.IOSpatialMap as SM
 import qualified Data.Vector as V
 import Data.Time.Clock.System (SystemTime (..), getSystemTime)
+import Data.UUID
 import Data.UUID.V4
+import Data.Maybe (fromMaybe)
+import Data.IORef (newIORef, readIORef)
+import GHC.IORef (writeIORef)
+import Control.Applicative ((<|>))
+import Control.Monad.State.Strict (StateT(runStateT), execStateT)
 import qualified Inputs.MouseHandling as MouseHandling
+import Control.Monad (forM_)
 import Graphics.Fonts
-import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
-import Control.Monad (when, unless)
-import GHC.Float (int2Float)
-import Control.Monad.RWS.Strict (runRWST)
 
 --------------------------------------------------------------------------------
 
@@ -69,18 +77,18 @@ instance Show CpuGpuRepPair where
 instance PolygonShape CpuGpuRepPair where
   toPolygon o@CpuGpuRepPair{_cpuRep = a} = toPolygon a
   toBoundary o@CpuGpuRepPair{_cpuRep = a} = toBoundary a
+  applyConfig o@CpuGpuRepPair{_cpuRep = a} conf = o{_cpuRep = applyConfig a conf}
 
 $(makeLenses ''CpuGpuRepPair)
 
-
-type OBS = IORef State
+type Demo = RWST Env () State IO
 
 data State = State
     { _stateWindowWidth           :: !Int
     , _stateWindowHeight          :: !Int
-    -- , _stateElementsOnScreen      :: !(SM.IOSpatialMap CpuGpuRepPair)
+    , _stateElementsOnScreen      :: !(SM.IOSpatialMap CpuGpuRepPair)
     , _stateRenderedCache         :: !(V.Vector RenderedObject)
-    , _stateInteractable          :: !(M.Map String (MouseHandlingType, MouseHandling.MouseHandlingEvents IO MouseHandlingType))
+    , _stateInteractable          :: !(M.Map String (MouseHandlingType, MouseHandling.MouseHandlingEvents Demo MouseHandlingType))
     , _stateMousePos              :: !(Int, Int)
     , _stateMousePosPreviousFrame :: !(Int, Int)
     , _stateMouseButtonState      :: !MouseHandling.MouseButtonState
@@ -92,8 +100,8 @@ data State = State
 
 data Plugins = Plugins
     {
-          _pluginsInterpolation:: !(Interp.InterpolationEnv, Interp.InterpolationState IO)
-        , _pluginsMouseHandling:: !(MouseHandling.MouseHandlingEnv IO MouseHandlingType, MouseHandling.MouseHandlingState MouseHandlingType)
+          _pluginsInterpolation:: !(Interp.InterpolationEnv, Interp.InterpolationState Demo)
+        , _pluginsMouseHandling:: !(MouseHandling.MouseHandlingEnv Demo MouseHandlingType, MouseHandling.MouseHandlingState MouseHandlingType)
     }
 
 type MouseHandlingType = CpuGpuRepPair
@@ -110,16 +118,16 @@ $(makeLenses ''MouseHandling.ModifierKeys)
 
 --------------------------------------------------------------------------------
 
--- getFromHashMap:: UUID -> IO (Maybe CpuGpuRepPair)
+-- getFromHashMap:: UUID -> Demo (Maybe CpuGpuRepPair)
 -- getFromHashMap uuid = do
 --     interactable <- _stateInteractable <$> get
 
 --     return $ M.lookup uuid interactable
 
-insertToHashMap:: OBS -> (MouseHandling.Interactable MouseHandlingType, MouseHandling.MouseHandlingEvents IO MouseHandlingType) -> IO ()
-insertToHashMap obs pair@(i, events) = do
+insertToHashMap:: (MouseHandling.Interactable MouseHandlingType, MouseHandling.MouseHandlingEvents Demo MouseHandlingType) -> Demo ()
+insertToHashMap pair@(i, events) = do
     let handlingLens = pluginsMouseHandling . _1 . mouseHandlingEnvInteractables
-    modifyIORef' obs $ \s -> s & (statePlugins . handlingLens) %~ \m -> M.insert (MouseHandling.interactableId i) pair m
+    modify $ \s -> s & (statePlugins . handlingLens) %~ \m -> M.insert (MouseHandling.interactableId i) pair m
 
     return()
 
@@ -127,7 +135,7 @@ insertToHashMap obs pair@(i, events) = do
 createState:: Int -> Int -> IO State
 createState width height = do
 
-    -- spatialMap <- SM.createIOSpatialMap (20, 20) (width, height)
+    spatialMap <- liftIO $ SM.createIOSpatialMap (20, 20) (width, height)
     sysTime <- getSystemTime
 
     plugins <- createPlugins
@@ -135,7 +143,7 @@ createState width height = do
     return State
         { _stateWindowWidth           = width
         , _stateWindowHeight          = height
-        -- , _stateElementsOnScreen      = spatialMap
+        , _stateElementsOnScreen      = spatialMap
         , _stateRenderedCache         = V.empty
         , _stateInteractable          = M.empty
         , _stateMousePos              = (0,0)
@@ -178,15 +186,15 @@ createPlugins = do
     }
 
 
-updatePluginInputs:: OBS -> IO ()
-updatePluginInputs obs = do
+updatePluginInputs:: Demo ()
+updatePluginInputs = do
     -- Interpolation plugin
-    sysTime <- getSystemTime
+    sysTime <- liftIO getSystemTime
 
-    modifyIORef' obs $ \s -> s & (statePlugins . pluginsInterpolation . _1 . interpolationEnvTime) .~ sysTime
+    modify $ \s -> s & (statePlugins . pluginsInterpolation . _1 . interpolationEnvTime) .~ sysTime
 
     -- Mouse plugin
-    s <- readIORef obs
+    s <- get
 
     -- This should may be differently handled
     -- mouseHandlingEvents <- MouseHandling.emptyEvent
@@ -199,7 +207,7 @@ updatePluginInputs obs = do
         , MouseHandling._mouseHandlingEnvMouseCoordinatesPreviousFrame = s ^. stateMousePosPreviousFrame
     }
 
-    modifyIORef' obs $ \s -> s & (statePlugins . pluginsMouseHandling . _1 ) .~ mouseEnv 
+    modify $ \s -> s & (statePlugins . pluginsMouseHandling . _1 ) .~ mouseEnv 
 
     return ()
 
@@ -243,44 +251,44 @@ main = do
               , _envTimeStart       = sysTime
               , _envFreeTypeMapping = mapping
               }
-        iorefState <- newIORef st
-        runIO env iorefState
+        runDemo env st
 
     putStrLn "ended!"
 
 --------------------------------------------------------------------------------
 
-processInnerStateMonad:: OBS -> Interp.InterpolationPlugin IO a -> IO a
-processInnerStateMonad obs plugin = do 
-    (env, previousState) <- ( _pluginsInterpolation . _statePlugins ) <$> readIORef obs
+processInnerStateMonad:: Interp.InterpolationPlugin Demo a -> Demo a
+processInnerStateMonad plugin = do 
+    (env, previousState) <- ( _pluginsInterpolation . _statePlugins ) <$> get 
     (a, r, _) <- runRWST plugin env previousState 
     -- Monad within clicking can change environment variable
-    (envNew, _) <- ( _pluginsInterpolation . _statePlugins ) <$> readIORef obs 
-    modifyIORef' obs $ \s -> s & (statePlugins . pluginsInterpolation) .~ (envNew, r)
+    (envNew, _) <- ( _pluginsInterpolation . _statePlugins ) <$> get 
+    modify $ \s -> s & (statePlugins . pluginsInterpolation) .~ (envNew, r)
     return a
 
 
-processInnerStateMonadMouse:: OBS -> MouseHandling.MouseHandlingPlugin IO MouseHandlingType b -> IO b
-processInnerStateMonadMouse obs plugin = do 
-    (env, previousState) <- ( _pluginsMouseHandling . _statePlugins ) <$> readIORef obs
-    (a, r, _) <- runRWST plugin env previousState
+processInnerStateMonadMouse:: MouseHandling.MouseHandlingPlugin Demo MouseHandlingType b -> Demo b
+processInnerStateMonadMouse plugin = do 
+    (env, previousState) <- ( _pluginsMouseHandling . _statePlugins ) <$> get 
+    (a, r, _) <- runRWST plugin env previousState 
     -- Monad within clicking can change environment variable
-    (envNew, _) <- ( _pluginsMouseHandling . _statePlugins ) <$> readIORef obs
-    modifyIORef' obs $ \s -> s & (statePlugins . pluginsMouseHandling) .~ (envNew, r)
+    (envNew, _) <- ( _pluginsMouseHandling . _statePlugins ) <$> get 
+    modify $ \s -> s & (statePlugins . pluginsMouseHandling) .~ (envNew, r)
     return a
 
-startup:: Env -> OBS -> IO ()
-startup env obs = do
-    width  <- _stateWindowWidth <$> readIORef obs
-    height <- _stateWindowHeight <$> readIORef obs
+startup:: Demo ()
+startup = do
+    state <- get
+    let width  = _stateWindowWidth  state
+        height = _stateWindowHeight state
 
 
     let conf = emptyConfig {_m_backgroundColor = Just $ RGBA (Linear.V4 0 1 0 1)}
     let thing = Circle{_circlePosition= Linear.V2 100 800, _diameter = 100 }
 
-    program <- askForShader env "BasicShaders"
+    program <- askForShader "BasicShaders"
 
-    cache <- bindToGL thing conf program
+    cache <- liftIO $ bindToGL thing conf program
 
     let objectToRender = ObjectToRender {
             _objectToRenderPrimitiveObject = toPrimitive thing
@@ -293,7 +301,7 @@ startup env obs = do
     let conf2 = emptyConfig {_m_backgroundColor = Just $ RGBA (Linear.V4 0 1 1 1)}
     let thing2 = Circle{_circlePosition= Linear.V2 300 100, _diameter = 80 }
 
-    cache2 <- bindToGL thing2 conf2 program
+    cache2 <- liftIO $ bindToGL thing2 conf2 program
 
     let objectToRender2 = ObjectToRender {
             _objectToRenderPrimitiveObject = toPrimitive thing2
@@ -309,12 +317,12 @@ startup env obs = do
 
     let recs = map (\(x, y) -> Rectangle (Linear.V2 x y) 10 10) [(x,y)| y <- [10,30..120],  x <- [10,30..120]]
 
-    programInstanced <- askForShader env "InstancedShaders"
+    programInstanced <- askForShader "InstancedShaders"
 
-    cache3 <- bindInstancedToGL recs conf2 programInstanced
+    cache3 <- liftIO $ bindInstancedToGL recs conf2 programInstanced
 
     pair3 <- imapM (\i rect -> do 
-        uuid3 <- nextRandom
+        uuid3 <- liftIO nextRandom
         return $ CpuGpuRepPair ObjectToRender {
             _objectToRenderPrimitiveObject = toPrimitive rect
         ,   _objectToRenderConfig = conf2
@@ -323,19 +331,52 @@ startup env obs = do
         ,   _objectToRenderProgram = programInstanced
     } cache3) recs
 
-    let mapping = _envFreeTypeMapping env
-    let chars = mapping "Hello world,\těščřžýáíéó" "Oswald-Regular.ttf"
+    mapping <- asks _envFreeTypeMapping
+    let chars = mapping "Hello world, ěščřžýáíéó" "Oswald-Regular.ttf"
 
-    fontShader <- askForShader env "FontShaders"
+    fontShader <- askForShader "FontShaders"
     let t = Text (Linear.V2 200 200) chars
-    cache4 <- bindToGL t conf2 fontShader 
+    cache4 <- liftIO $ bindToGL t conf2 fontShader 
 
 
     let chars2 = mapping (show [x | x <- [1..12]]) "ComicNeue-Regular.ttf"
 
     let t = Text (Linear.V2 200 300) chars2 
-    cache5 <- bindToGL t conf2 fontShader 
+    cache5 <- liftIO $ bindToGL t conf2 fontShader 
     -- isCancelledRef <- liftIO $ newIORef False
+    -- let someOnRelease x y = do
+    --         m_val <- getFromHashMap uuid2
+    --         let m_obj = (_objectToRenderPrimitiveObject . _cpuRep) <$> m_val 
+    --         let defaultOrAlreadyExisting = fromMaybe (toPrimitive thing2) m_obj
+    --         let floatX = double2Float x 
+    --         let floatY = double2Float y
+
+    --         when (isPointInsidePolygon (defaultOrAlreadyExisting) (floatX, floatY)) $ do
+    --             liftIO $ writeIORef isCancelledRef False
+    --             processInnerStateMonad $ Interp.lerp2 1000 (Linear.V2 floatX floatY) (Linear.V2 floatX 0) $ \(Linear.V2 a b) -> do
+    --                 isCancelled <- liftIO $ readIORef isCancelledRef
+    --                 unless isCancelled $ do 
+    --                     let newConf = (emptyConfig { _m_translate = Just $ (Linear.V3 a b 0)}) `combine` conf
+    --                     let v = pair2 & (cpuRep . objectToRenderPrimitiveObject) .~ applyConfig (toPrimitive thing2) newConf
+    --                     -- insertToHashMap v 
+    --                     -- let iWithinBuffer = obj ^. objectToRenderIndexWithinBuffer
+    --                     liftIO $ (cache2 ^. renderedObjectBindConfig) 1 newConf 
+    --                     return ()
+    --         return ()
+
+    -- let someOnPress x y = do
+    --         m_val <- getFromHashMap uuid2
+    --         let m_obj = (_objectToRenderPrimitiveObject . _cpuRep) <$> m_val 
+    --         let defaultOrAlreadyExisting = fromMaybe (toPrimitive thing2) m_obj
+
+    --         when (isPointInsidePolygon (defaultOrAlreadyExisting) (double2Float x, double2Float y)) $ do
+    --             liftIO $ writeIORef isCancelledRef True
+    --             let conf = emptyConfig { _m_translate = Just $ Linear.V3 (double2Float x) (double2Float y) 0, _m_backgroundColor = Just $ RGBA $ Linear.V4 1 0 0 0}
+    --             let v = pair2 & (cpuRep . objectToRenderPrimitiveObject) .~ applyConfig (toPrimitive thing2) conf
+    --             -- insertToHashMap v 
+    --             -- let iWithinBuffer = obj ^. objectToRenderIndexWithinBuffer
+    --             liftIO $ (cache2 ^. renderedObjectBindConfig) 1 conf
+    --             return ()
 
     mouseHandlingEvents <- MouseHandling.emptyEvent
 
@@ -351,7 +392,7 @@ startup env obs = do
 
             -- let coordinatesToFollow = coords defaultOrAlreadyExistingFollow
             -- let startCoords = coords defaultOrAlreadyExisting
-            processInnerStateMonad obs $ Interp.lerp2 1200 (Linear.V2 floatX floatY) (Linear.V2 (floatX + 100) (floatY + 100)) $ \vec -> do
+            processInnerStateMonad $ Interp.lerp2 1200 (Linear.V2 floatX floatY) (Linear.V2 (floatX + 100) (floatY + 100)) $ \vec -> do
                 -- let conf = emptyConfig { _m_translate = Just $ (Linear.V3 a b 0)}
                 let newV = case element ^. (cpuRep . objectToRenderPrimitiveObject) of
                         (PrimitiveCircle (Circle t d)) -> PrimitiveCircle $ Circle vec d 
@@ -360,21 +401,21 @@ startup env obs = do
                 -- insertToHashMap $ (applyConfig element conf, mouseHandlingEvents & onMiceClicks .~ someOnClick)
                 -- let iWithinBuffer = obj ^. objectToRenderIndexWithinBuffer
                 -- insertToHashMap (MouseHandling.Interactable pair2 "2", mouseHandlingEvents & onMiceClicks .~ someOnClick)
-                insertToHashMap obs (MouseHandling.Interactable v id, elementEvents)
-                (v ^. (gpuRep . renderedObjectRebind)) (v ^. (cpuRep . objectToRenderPrimitiveObject)) 1 conf
+                insertToHashMap (MouseHandling.Interactable v id, elementEvents)
+                liftIO $ (v ^. (gpuRep . renderedObjectRebind)) (v ^. (cpuRep . objectToRenderPrimitiveObject)) 1 conf
                 return ()
             return ()
 
                     --  & stateInteractable .~ M.fromList [pair, pair2] ++ pair3
-    modifyIORef' obs $ \s -> s & stateRenderedCache .~ V.fromList [cache, cache2, cache3, cache4, cache5]
+    modify $ \s -> s & stateRenderedCache .~ V.fromList [cache, cache2, cache3, cache4, cache5]
 
-    insertToHashMap obs
+    insertToHashMap 
         (
             MouseHandling.Interactable pair2 "2", 
             mouseHandlingEvents & onMiceClicks .~ someOnClick
-                                & onMiceMove .~ onMouseMove obs
-                                & onMiceEnter .~ onHover obs
-                                & onMiceLeave .~ onHoverOut obs
+                                & onMiceMove .~ onMouseMove
+                                & onMiceEnter .~ onHover
+                                & onMiceLeave .~ onHoverOut
         )
     -- insertToHashMap pair2
     -- mapM_ insertToHashMap pair3
@@ -382,8 +423,8 @@ startup env obs = do
     return ()
 
 
-onHover :: OBS -> (a, b) -> p -> (CpuGpuRepPair, MouseHandling.MouseHandlingEvents IO MouseHandlingType) -> String -> IO ()
-onHover obs (x,y) modKeys (element, elementEvents) id = do
+onHover :: (a, b) -> p -> (CpuGpuRepPair, MouseHandling.MouseHandlingEvents Demo MouseHandlingType) -> String -> Demo ()
+onHover (x,y) modKeys (element, elementEvents) id = do
     let conf = emptyConfig { 
         _m_backgroundColor = Just $ RGBA (Linear.V4 1 0 0 1)}
 
@@ -393,12 +434,12 @@ onHover obs (x,y) modKeys (element, elementEvents) id = do
 
     let v = element & (cpuRep . objectToRenderPrimitiveObject) .~ newV
                     & (cpuRep . objectToRenderConfig) .~ conf
-    insertToHashMap obs (MouseHandling.Interactable v id, elementEvents)
-    (v ^. (gpuRep . renderedObjectRebind)) (v ^. (cpuRep . objectToRenderPrimitiveObject)) 1 conf
+    insertToHashMap (MouseHandling.Interactable v id, elementEvents)
+    liftIO $ (v ^. (gpuRep . renderedObjectRebind)) (v ^. (cpuRep . objectToRenderPrimitiveObject)) 1 conf
     return ()
 
-onHoverOut :: OBS -> (a, b) -> p -> (CpuGpuRepPair, MouseHandling.MouseHandlingEvents IO MouseHandlingType) -> String -> IO ()
-onHoverOut obs (x,y) modKeys (element, elementEvents) id = do
+onHoverOut :: (a, b) -> p -> (CpuGpuRepPair, MouseHandling.MouseHandlingEvents Demo MouseHandlingType) -> String -> Demo ()
+onHoverOut (x,y) modKeys (element, elementEvents) id = do
     let conf = emptyConfig { 
             _m_backgroundColor = Just $ RGBA (Linear.V4 0 1 0 1)}
 
@@ -408,12 +449,12 @@ onHoverOut obs (x,y) modKeys (element, elementEvents) id = do
 
     let v = element & (cpuRep . objectToRenderPrimitiveObject) .~ newV
                     & (cpuRep . objectToRenderConfig) .~ conf
-    insertToHashMap obs (MouseHandling.Interactable v id, elementEvents)
-    (v ^. (gpuRep . renderedObjectRebind)) (v ^. (cpuRep . objectToRenderPrimitiveObject)) 1 conf
+    insertToHashMap (MouseHandling.Interactable v id, elementEvents)
+    liftIO $ (v ^. (gpuRep . renderedObjectRebind)) (v ^. (cpuRep . objectToRenderPrimitiveObject)) 1 conf
     return ()
 
-onMouseMove :: OBS -> (Int, Int) -> MouseHandling.ModifierKeys -> (CpuGpuRepPair, MouseHandling.MouseHandlingEvents IO MouseHandlingType) -> String -> IO ()
-onMouseMove obs (x,y) modKeys (element, elementEvents) id = do
+onMouseMove :: (Int, Int) -> MouseHandling.ModifierKeys -> (CpuGpuRepPair, MouseHandling.MouseHandlingEvents Demo MouseHandlingType) -> String -> Demo ()
+onMouseMove (x,y) modKeys (element, elementEvents) id = do
     when (MouseHandling._mouseHandlingCtrlPressed modKeys) $ do
         let newV = case element ^. (cpuRep . objectToRenderPrimitiveObject) of
                 (PrimitiveCircle (Circle t d)) -> PrimitiveCircle $ Circle (Linear.V2 (int2Float x) (int2Float y)) (d)
@@ -421,9 +462,13 @@ onMouseMove obs (x,y) modKeys (element, elementEvents) id = do
 
         let v = element & (cpuRep . objectToRenderPrimitiveObject) .~ newV
                         -- & (cpuRep . objectToRenderConfig) .~ conf
-        insertToHashMap obs (MouseHandling.Interactable v id, elementEvents)
-        (v ^. (gpuRep . renderedObjectRebind)) (v ^. (cpuRep . objectToRenderPrimitiveObject)) 1 (v ^. (cpuRep . objectToRenderConfig))
+        insertToHashMap (MouseHandling.Interactable v id, elementEvents)
+        liftIO $ (v ^. (gpuRep . renderedObjectRebind)) (v ^. (cpuRep . objectToRenderPrimitiveObject)) 1 (v ^. (cpuRep . objectToRenderConfig))
     return ()
+
+-- GLFW-b is made to be very close to the C API, so creating a window is pretty
+-- clunky by Haskell standards. A higher-level API would have some function
+-- like withWindow.
 
 withWindow :: Int -> Int -> String -> (GLFW.Window -> IO ()) -> IO ()
 withWindow width height title f = do
@@ -481,79 +526,83 @@ charCallback            tc win c          = atomically $ writeTQueue tc $ EventC
 --------------------------------------------------------------------------------
 
 
-runIO :: Env -> OBS -> IO ()
-runIO env obs = adjustWindow obs >> startup env obs >> run env obs 
+runDemo :: Env -> State -> IO ()
+runDemo env state = do
+    void $ evalRWST (adjustWindow >> startup >> run) env state
 
-askForShader:: Env -> B.ByteString -> IO GL.Program
-askForShader env shaderName = do
-    let programMap = _envStateShaders env
+askForShader:: B.ByteString -> Demo GL.Program
+askForShader shaderName = do
+    programMap <-  asks _envStateShaders
 
     return $ case programMap M.!? shaderName of
         Nothing -> error "Check shader name once again, is it created?"
         Just p -> p
 
-run :: Env -> OBS -> IO ()
-run env obs = do
-    sysTime <- getSystemTime
-    modifyIORef' obs $ \s -> s & stateFrameCounter %~ (+) 1
+run :: Demo ()
+run = do
+    sysTime <- liftIO getSystemTime
+    modify $ \s -> s & stateFrameCounter %~ (+) 1
                      & stateCurrentSysTime .~ sysTime
 
-    let win = _envWindow env
+    win <- asks _envWindow
 
-    cache <- _stateRenderedCache <$> readIORef obs
+    cache <- _stateRenderedCache <$> get
 
-    GL.clear [GL.ColorBuffer, GL.DepthBuffer]
+    liftIO $ do
+        GL.clear [GL.ColorBuffer, GL.DepthBuffer]
 
-    mapM_ (draw obs) cache
+    mapM_ draw cache
 
-    GLFW.swapBuffers win
-    GL.flush  -- not necessary, but someone recommended it
-    GLFW.pollEvents
-    processEvents env obs
+    liftIO $ do
+        GLFW.swapBuffers win
+        GL.flush  -- not necessary, but someone recommended it
+        GLFW.pollEvents
+    processEvents
 
-    processInnerStateMonad obs Interp.processInterpolations
-    processInnerStateMonadMouse obs MouseHandling.processMouseEvents
-    updatePluginInputs obs
+    processInnerStateMonad Interp.processInterpolations
+    processInnerStateMonadMouse MouseHandling.processMouseEvents
+    updatePluginInputs
 
-    modifyIORef' obs $ \s -> s & stateMousePosPreviousFrame .~ (s ^. stateMousePos)
+    modify $ \s -> s & stateMousePosPreviousFrame .~ (s ^. stateMousePos)
 
-    q <- GLFW.windowShouldClose win
-    unless q (run env obs)
+    q <- liftIO $ GLFW.windowShouldClose win
+    unless q run
 
-processEvents :: Env -> OBS -> IO ()
-processEvents env obs = do
-    let tc = _envEventsChan env
-    me <- atomically $ tryReadTQueue tc
+processEvents :: Demo ()
+processEvents = do
+    tc <- asks _envEventsChan
+    me <- liftIO $ atomically $ tryReadTQueue tc
     case me of
       Just e -> do
-          processEvent env obs e
-          processEvents env obs
+          processEvent e
+          processEvents
       Nothing -> return ()
 
-printEvent :: String -> [String] -> IO ()
+printEvent :: String -> [String] -> Demo ()
 printEvent cbname fields =
-    putStrLn $ cbname ++ ": " ++ unwords fields
+    liftIO $ putStrLn $ cbname ++ ": " ++ unwords fields
 
-setMousePos:: Env -> OBS -> Int -> Int -> IO ()
-setMousePos env obs x y = do
-    height <- _stateWindowHeight <$> readIORef obs
-    modifyIORef' obs $ \s -> s & stateMousePos .~ (x, height - y)
+setMousePos:: Int -> Int -> Demo ()
+setMousePos x y = do
+    state <- get
+    let height = _stateWindowHeight state
+    modify $ \s -> s & stateMousePos .~ (x, height - y)
 
-activateMouseHandling:: OBS -> IO ()
-activateMouseHandling obs = do
-    modifyIORef' obs $ \s -> s & (statePlugins . pluginsMouseHandling . _1 . mouseHandlingActivated) .~ True
+activateMouseHandling:: Demo ()
+activateMouseHandling = do
+    modify $ \s -> s & (statePlugins . pluginsMouseHandling . _1 . mouseHandlingActivated) .~ True
 
-isMouseHandlingActivated:: OBS -> IO Bool
-isMouseHandlingActivated obs =
-    readIORef obs >>= \s -> return $ s ^. (statePlugins . pluginsMouseHandling . _1 . mouseHandlingActivated)
+isMouseHandlingActivated:: Demo Bool
+isMouseHandlingActivated =
+    get >>= \s -> return $ s ^. (statePlugins . pluginsMouseHandling . _1 . mouseHandlingActivated)
     
-processEvent :: Env -> OBS -> Event -> IO ()
-processEvent env obs ev =
+processEvent :: Event -> Demo ()
+processEvent ev =
     case ev of
       (EventError e s) -> do
           printEvent "error" [show e, show s]
-          let win = _envWindow env
-          GLFW.setWindowShouldClose win True
+          win <- asks _envWindow
+          liftIO $ GLFW.setWindowShouldClose win True
 
       (EventWindowSize _ width height) ->
           printEvent "window size" [show width, show height]
@@ -563,26 +612,26 @@ processEvent env obs ev =
 
       (EventFramebufferSize _ width height) -> do
           printEvent "framebuffer size" [show width, show height]
-          modifyIORef' obs $ \s -> s
+          modify $ \s -> s
             { _stateWindowWidth  = width
             , _stateWindowHeight = height
             }
-          adjustWindow obs
+          adjustWindow
 
       (EventScroll _ x y) -> do
-          adjustWindow obs
+          adjustWindow
 
       (EventCursorPos _ x y) -> do
         -- screenHeight <- _stateWindowHeight <$> get
         -- grid <- _stateElementsOnScreen <$> get
 
-        setMousePos env obs (fromEnum x) (fromEnum y)
-        iMHA <- isMouseHandlingActivated obs
+        setMousePos (fromEnum x) (fromEnum y)
+        iMHA <- isMouseHandlingActivated
         -- Because both mouse positions were set at first frame at 0,0 it would cause
         -- Ray cast from top left corner to somewhere within the canvas
         unless iMHA $ 
-            modifyIORef' obs $ \s -> s & stateMousePosPreviousFrame .~ (fromEnum x, fromEnum y)
-        activateMouseHandling obs
+            modify $ \s -> s & stateMousePosPreviousFrame .~ (fromEnum x, fromEnum y)
+        activateMouseHandling
         -- val <- lookupValueFromTree (floor x,screenHeight - floor y)
 
         return ()
@@ -591,75 +640,75 @@ processEvent env obs ev =
           let mouseButtonLens = statePlugins . pluginsMouseHandling . _1 . mouseHandlingModifierKeys
 
           unless (ks == GLFW.KeyState'Repeating) $ case k of
-            GLFW.Key'LeftControl  -> modifyIORef' obs $ \s -> s & (mouseButtonLens . mouseHandlingCtrlPressed) .~ (ks == GLFW.KeyState'Pressed)
-            GLFW.Key'RightControl -> modifyIORef' obs $ \s -> s & (mouseButtonLens . mouseHandlingCtrlPressed) .~ (ks == GLFW.KeyState'Pressed)
-            GLFW.Key'LeftAlt      -> modifyIORef' obs $ \s -> s & (mouseButtonLens . mouseHandlingAltPressed)     .~ (ks == GLFW.KeyState'Pressed)
-            GLFW.Key'RightAlt     -> modifyIORef' obs $ \s -> s & (mouseButtonLens . mouseHandlingAltPressed)     .~ (ks == GLFW.KeyState'Pressed)
-            GLFW.Key'LeftSuper    -> modifyIORef' obs $ \s -> s & (mouseButtonLens . mouseHandlingSuperPressed)   .~ (ks == GLFW.KeyState'Pressed)
-            GLFW.Key'RightSuper   -> modifyIORef' obs $ \s -> s & (mouseButtonLens . mouseHandlingSuperPressed)   .~ (ks == GLFW.KeyState'Pressed)
-            GLFW.Key'LeftShift    -> modifyIORef' obs $ \s -> s & (mouseButtonLens . mouseHandlingShiftPressed)   .~ (ks == GLFW.KeyState'Pressed)
-            GLFW.Key'RightShift   -> modifyIORef' obs $ \s -> s & (mouseButtonLens . mouseHandlingShiftPressed)   .~ (ks == GLFW.KeyState'Pressed)
+            GLFW.Key'LeftControl  -> modify $ \s -> s & (mouseButtonLens . mouseHandlingCtrlPressed) .~ (ks == GLFW.KeyState'Pressed)
+            GLFW.Key'RightControl -> modify $ \s -> s & (mouseButtonLens . mouseHandlingCtrlPressed) .~ (ks == GLFW.KeyState'Pressed)
+            GLFW.Key'LeftAlt      -> modify $ \s -> s & (mouseButtonLens . mouseHandlingAltPressed)     .~ (ks == GLFW.KeyState'Pressed)
+            GLFW.Key'RightAlt     -> modify $ \s -> s & (mouseButtonLens . mouseHandlingAltPressed)     .~ (ks == GLFW.KeyState'Pressed)
+            GLFW.Key'LeftSuper    -> modify $ \s -> s & (mouseButtonLens . mouseHandlingSuperPressed)   .~ (ks == GLFW.KeyState'Pressed)
+            GLFW.Key'RightSuper   -> modify $ \s -> s & (mouseButtonLens . mouseHandlingSuperPressed)   .~ (ks == GLFW.KeyState'Pressed)
+            GLFW.Key'LeftShift    -> modify $ \s -> s & (mouseButtonLens . mouseHandlingShiftPressed)   .~ (ks == GLFW.KeyState'Pressed)
+            GLFW.Key'RightShift   -> modify $ \s -> s & (mouseButtonLens . mouseHandlingShiftPressed)   .~ (ks == GLFW.KeyState'Pressed)
             _ -> return ()
 
 
           when (ks == GLFW.KeyState'Pressed) $ do
               -- Q, Esc: exit
               when (k == GLFW.Key'Escape) $
-                GLFW.setWindowShouldClose win True
+                liftIO $ GLFW.setWindowShouldClose win True
 
       (EventMouseButton _ mb mba mk) -> do
 
         when (mb == GLFW.MouseButton'1) $ do
             let mouseButtonLens = statePlugins . pluginsMouseHandling . _1 
             case mba of
-                GLFW.MouseButtonState'Pressed -> modifyIORef' obs $ \s -> s & (mouseButtonLens . mouseHandlingMouseButtonState) .~ MouseHandling.PressDown
-                GLFW.MouseButtonState'Released -> modifyIORef' obs $ \s -> s & (mouseButtonLens . mouseHandlingMouseButtonState) .~ MouseHandling.Released
+                GLFW.MouseButtonState'Pressed -> modify $ \s -> s & (mouseButtonLens . mouseHandlingMouseButtonState) .~ MouseHandling.PressDown
+                GLFW.MouseButtonState'Released -> modify $ \s -> s & (mouseButtonLens . mouseHandlingMouseButtonState) .~ MouseHandling.Released
 
             return ()
 
       _ -> return ()
 
-adjustWindow :: OBS -> IO ()
-adjustWindow obs = do
-    width  <- _stateWindowWidth <$> readIORef obs 
-    height <- _stateWindowWidth <$> readIORef obs 
-    let
+adjustWindow :: Demo ()
+adjustWindow = do
+    state <- get
+    let width  = _stateWindowWidth  state
+        height = _stateWindowHeight state
         pos    = GL.Position 0 0
         size  = GL.Size (fromIntegral width) (fromIntegral height)
     return ()
 
-setViewProjectionMatrix:: OBS -> GL.Program -> IO ()
-setViewProjectionMatrix obs program = do
-    (w,h) <- readIORef obs >>= \s -> return (_stateWindowWidth s, _stateWindowHeight s)
+setViewProjectionMatrix:: GL.Program -> Demo ()
+setViewProjectionMatrix program = do
+    (w,h) <- get >>= \s -> return (_stateWindowWidth s, _stateWindowHeight s)
 
     let proj = Linear.ortho (0) ( (int2Float w)) 0 (int2Float h) (int2Float (-w)) (int2Float w)
-    matProj <- (GL.newMatrix GL.RowMajor $ concatMap toList proj :: IO (GL.GLmatrix GL.GLfloat))
+    matProj <- liftIO (GL.newMatrix GL.RowMajor $ concatMap toList proj :: IO (GL.GLmatrix GL.GLfloat))
 
     projectionLocation <- GL.get (GL.uniformLocation program "projection")
     GL.uniform projectionLocation  GL.$= matProj
 
--- insertValueToQuadtree:: [CpuGpuRepPair] -> IO ()
--- insertValueToQuadtree elems = do
---     width <- _stateWindowWidth <$> get
---     height <- _stateWindowHeight <$> get
---     grid <- _stateElementsOnScreen <$> get
---     val <- liftIO $ foldrM (\spatialDat t ->
---         let x = spatialDat ^. cpuRep ^.  objectToRenderPrimitiveObject in
---         let (corner1, corner2)= toBoundary x in
---             SM.appendGridRange (corner1 & both %~ floor) (corner2 & both %~ floor) spatialDat t)
---         grid elems
+insertValueToQuadtree:: [CpuGpuRepPair] -> Demo ()
+insertValueToQuadtree elems = do
+    width <- _stateWindowWidth <$> get
+    height <- _stateWindowHeight <$> get
+    grid <- _stateElementsOnScreen <$> get
+    val <- liftIO $ foldrM (\spatialDat t ->
+        let x = spatialDat ^. cpuRep ^.  objectToRenderPrimitiveObject in
+        let (corner1, corner2)= toBoundary x in
+            SM.appendGridRange (corner1 & both %~ floor) (corner2 & both %~ floor) spatialDat t)
+        grid elems
 
---     return ()
+    return ()
 
--- lookupValueFromTree:: Coord -> IO [CpuGpuRepPair]
--- lookupValueFromTree coord@(px, py) = do
---     width <- _stateWindowWidth <$> get
---     height <- _stateWindowHeight <$> get
+lookupValueFromTree:: Coord -> Demo [CpuGpuRepPair]
+lookupValueFromTree coord@(px, py) = do
+    width <- _stateWindowWidth <$> get
+    height <- _stateWindowHeight <$> get
 
---     -- InstancedCache vals <- _stateRenderedCache <$> get
---     grid <- _stateElementsOnScreen <$> get
---     vals <- liftIO $ SM.lookupCoords coord grid
---     let numOfVals = length vals
+    -- InstancedCache vals <- _stateRenderedCache <$> get
+    grid <- _stateElementsOnScreen <$> get
+    vals <- liftIO $ SM.lookupCoords coord grid
+    let numOfVals = length vals
     -- liftIO $ print grid
     -- val <- mapM (\a@SM.SpatialData{SM._spatialData = x} -> do
     --     let r = x ^. gpuRep ^. renderedObjectBuffers
@@ -677,20 +726,22 @@ setViewProjectionMatrix obs program = do
     --     return x
     --     ) vals
     -- return val
-    -- return []
+    return []
 
-draw:: OBS -> RenderedObject -> IO ()
-draw obs renderedObject = do
-    -- width <- _stateWindowWidth <$> readIORef obs 
-    -- height <- _stateWindowHeight <$> readIORef obs 
+draw:: RenderedObject -> Demo ()
+draw renderedObject = do
+    width <- _stateWindowWidth <$> get
+    height <- _stateWindowHeight <$> get
     let vao = renderedObject ^. (renderedObjectBuffers . glBuffersObject)
     let program = renderedObject ^. renderedObjectProgram
-    GL.currentProgram GL.$= Just program
+    liftIO $ do
+        GL.currentProgram GL.$= Just program
 
-    setViewProjectionMatrix obs program
+    setViewProjectionMatrix program
 
-    GL.bindVertexArrayObject GL.$= Just vao
-    renderedObject ^. renderedObjectDrawCall
-    GL.bindVertexArrayObject GL.$= Nothing
+    liftIO $ do
+        GL.bindVertexArrayObject GL.$= Just vao
+        renderedObject ^. renderedObjectDrawCall
+        GL.bindVertexArrayObject GL.$= Nothing
 
     return ()
